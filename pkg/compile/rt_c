@@ -4,17 +4,17 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#if !defined(_MA_DEBUG)
-#define _MA_DEBUG false
-#endif
-static bool _ma_debug = _MA_DEBUG;
-
+#if defined(_MA_DEBUG)
+static bool _ma_debug = true;
 #define _MA_DEBUGF(fmt, ...) \
   do { \
     if (_ma_debug) { \
       fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
     } \
   } while (0)
+#else /* _MA_DEBUG */
+#define _MA_DEBUGF(fmt, ...)
+#endif /* _MA_DEBUG */
 
 #define _MA_FATALF(fmt, ...) \
   do { \
