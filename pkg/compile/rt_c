@@ -4,17 +4,17 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#if !defined(_MA_DEBUG)
-#define _MA_DEBUG false
-#endif
-static bool _ma_debug = _MA_DEBUG;
-
+#if defined(_MA_DEBUG)
+static bool _ma_debug = true;
 #define _MA_DEBUGF(fmt, ...) \
   do { \
     if (_ma_debug) { \
       fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
     } \
   } while (0)
+#else /* _MA_DEBUG */
+#define _MA_DEBUGF(fmt, ...)
+#endif /* _MA_DEBUG */
 
 #define _MA_FATALF(fmt, ...) \
   do { \
@@ -68,14 +68,28 @@ struct _ma_regs {
 
 struct _ma_regs _ma_regs;
 
-uint8_t _ma_vma[];
-#ifndef _MA_VMA_LEN
-#define _MA_VMA_LEN 0
-#endif
+struct _ma_vma_entry {
+  _ma_reg_t addr;
+  _ma_reg_t len;
+  _ma_reg_t bytes_len; /* Optional */
+  uint8_t bytes[]; /* Optional */
+} _ma_vma_entry;
+
+struct _ma_vma_entry *_ma_vma_entries[];
 
 void* _ma_translate_ptr(_ma_reg_t r) {
-  if (r < _MA_VMA_LEN) {
-    return &_ma_vma[r];
+  int i = 0;
+  for (;;) {
+    struct _ma_vma_entry *ent = _ma_vma_entries[i];
+    if (ent == NULL) break;
+    if (ent->addr <= r && r <= ent->addr + ent->len -1) {
+      if (ent->bytes_len == 0) {
+        _MA_FATALF("Unmapped VMA address 0x%08X", r);
+        return NULL;
+      }
+      return &ent->bytes[r - ent->addr];
+    }
+    i++;
   }
   return (void*)(long)r;
 }
