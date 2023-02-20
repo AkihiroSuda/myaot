@@ -232,22 +232,22 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
 					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-					fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _ma_regs.pc < (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] >u x[rs2]) pc += sext(offset) // unsigned
-					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc > (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if (%s > %s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-					fmt.Fprintf(w, "if ((signed)%s > (signed)%s) { _ma_regs.pc < (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
-					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc >= (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if (%s >= %s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				default:
 					return fmt.Errorf("unsupported Branch funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
 			case decoder.Lui: // lui rd,imm: x[rd] = sext(immediate[31:12] << 12)]
 				rd, imm := inst.GetRd(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(%d & 0xFFFFF000);\n", rd, imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(%d);\n", rd, imm)
 			case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)]
 				rd, imm := inst.GetRd(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)(%d & 0xFFFFF000);\n", rd, pc, imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)(%d);\n", rd, pc, imm)
 			case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
 				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + 4;\n", rd, pc)
