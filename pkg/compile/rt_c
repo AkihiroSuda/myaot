@@ -1,0 +1,99 @@
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#if !defined(_MA_DEBUG)
+#define _MA_DEBUG false
+#endif
+static bool _ma_debug = _MA_DEBUG;
+
+#define _MA_DEBUGF(fmt, ...) \
+  do { \
+    if (_ma_debug) { \
+      fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
+    } \
+  } while (0)
+
+#define _MA_FATALF(fmt, ...) \
+  do { \
+    fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
+    abort(); \
+  } while (0)
+
+#if !defined(_MA_REG_TYPE)
+#define _MA_REG_TYPE uint32_t
+#endif /* _MA_REG_TYPE */
+typedef _MA_REG_TYPE _ma_reg_t;
+
+#define _MA_REG_ZERO 0 /* Hard-wired zero */
+#define _MA_REG_RA 1 /* Return address */
+#define _MA_REG_SP 2 /* Stack pointer */
+#define _MA_REG_GP 3 /* GLobal pointer */
+#define _MA_REG_TP 4 /* Thread pointer */
+#define _MA_REG_T0 5 /* Temporary / alternate link register */
+#define _MA_REG_T1 6
+#define _MA_REG_T2 7
+#define _MA_REG_S0 8 /* Save register / frame pointer */
+#define _MA_REG_FP 8 /* Save register / frame pointer */
+#define _MA_REG_S1 9
+#define _MA_REG_A0 10
+#define _MA_REG_A1 11
+#define _MA_REG_A2 12
+#define _MA_REG_A3 13
+#define _MA_REG_A4 14
+#define _MA_REG_A5 15
+#define _MA_REG_A6 16
+#define _MA_REG_A7 17
+#define _MA_REG_S2 18
+#define _MA_REG_S3 19
+#define _MA_REG_S4 20
+#define _MA_REG_S5 21
+#define _MA_REG_S6 22
+#define _MA_REG_S7 23
+#define _MA_REG_S8 24
+#define _MA_REG_S9 25
+#define _MA_REG_S10 26
+#define _MA_REG_S11 27
+#define _MA_REG_T3 28
+#define _MA_REG_T4 29
+#define _MA_REG_T5 30
+#define _MA_REG_T6 31
+
+struct _ma_regs {
+  _ma_reg_t pc;
+  _ma_reg_t x[32];
+} _ma_regs;
+
+struct _ma_regs _ma_regs;
+
+uint8_t _ma_vma[];
+#ifndef _MA_VMA_LEN
+#define _MA_VMA_LEN 0
+#endif
+
+void* _ma_translate_ptr(_ma_reg_t r) {
+  if (r < _MA_VMA_LEN) {
+    return &_ma_vma[r];
+  }
+  return (void*)(long)r;
+}
+
+void _ma_ecall(void) {
+  _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
+      _ma_regs.x[_MA_REG_A7],
+      _ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2], _ma_regs.x[_MA_REG_A3], _ma_regs.x[_MA_REG_A4], _ma_regs.x[_MA_REG_A5]);
+  /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
+  switch (_ma_regs.x[_MA_REG_A7]){
+    case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
+      _ma_regs.x[_MA_REG_A0] = write((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
+      break;
+    case 93: /* asmlinkage long sys_exit(int error_code); */
+      exit((int)_ma_regs.x[_MA_REG_A0]);
+      break;
+    default:
+      _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
+      break;
+  }
+}
