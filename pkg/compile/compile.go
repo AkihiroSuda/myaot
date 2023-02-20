@@ -88,10 +88,11 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 		fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
 		fmt.Fprintf(w, ".addr = %d,\n", sec.Addr)
 		fmt.Fprintf(w, ".len = %d,\n", sec.Size)
-		if sec.Name == ".text" {
-			fmt.Fprintln(w, ".bytes_len = 0, /* No need to copy the .text section */")
-			fmt.Fprintln(w, ".bytes = {}, /* No need to copy the .text section */")
-		} else {
+		switch {
+		case sec.Name == ".text", sec.Type == elf.SHT_NOBITS:
+			fmt.Fprintln(w, ".bytes_len = 0,")
+			fmt.Fprintln(w, ".bytes = {},")
+		default:
 			dat, err := sec.Data()
 			if err != nil {
 				return err
