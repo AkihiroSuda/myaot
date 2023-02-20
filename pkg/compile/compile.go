@@ -138,6 +138,9 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "/* TODO: use an explicit jump table (for non-WASM?) */")
 	fmt.Fprintln(w, "switch(_ma_regs.pc) {")
 	textReader := textSec.Open()
+	if _, err := textReader.Seek(int64(elfFile.Entry-textSec.Addr), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to jump to the entry address 0x%08X", elfFile.Entry)
+	}
 	var inst32 uint32
 	for {
 		// TODO: support non-32 bit instructions
