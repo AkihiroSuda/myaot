@@ -37,16 +37,12 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 		return fmt.Errorf("expected Machine=EM_RISCV, got %v", f.Machine)
 	}
 
-	vmaLen := f.FileHeader.Entry
 	var textSec *elf.Section
 	for i, sec := range f.Sections {
 		i, sec := i, sec
 		logrus.Debugf("ELF: Section %d: %+v", i, sec.SectionHeader)
 		switch sec.SectionHeader.Type {
 		case elf.SHT_PROGBITS:
-			if sec.Addr >= vmaLen {
-				vmaLen = sec.Addr + sec.Size
-			}
 			switch sec.Name {
 			case ".text":
 				if textSec != nil {
@@ -54,19 +50,6 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 				}
 				textSec = sec
 			}
-		}
-	}
-
-	logrus.Debugf("ELF: VMA Length=%d", vmaLen)
-	vma := make([]byte, vmaLen)
-	for _, sec := range f.Sections {
-		switch sec.Type {
-		case elf.SHT_PROGBITS:
-			b, err := sec.Data()
-			if err != nil {
-				return err
-			}
-			copy(vma[sec.Addr:], b)
 		}
 	}
 
@@ -89,24 +72,52 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	default:
 		return fmt.Errorf("unknown ELF class %v", f.Class)
 	}
-	fmt.Fprintf(w, "#define _MA_VMA_LEN %d\n", vmaLen)
 	fmt.Fprintln(w, "")
 
 	// Copy rt_c
 	io.Copy(w, bytes.NewReader(rtC))
 	fmt.Fprintln(w, "")
 
-	// Generate VMA
-	fmt.Fprintln(w, "uint8_t _ma_vma[] = {")
-	// TODO: skip empty bytes
-	for i, b := range vma {
-		fmt.Fprintf(w, "0x%02X, ", b)
-		if i%16 == 15 {
-			fmt.Fprintln(w, "")
+	// Generate VMA entries
+	vmaEntryIdx := 0
+	for _, sec := range f.Sections {
+		if sec.Addr == 0 {
+			continue
 		}
+		fmt.Fprintf(w, "/* %+v */\n", sec.SectionHeader)
+		fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
+		fmt.Fprintf(w, ".addr = %d,\n", sec.Addr)
+		fmt.Fprintf(w, ".len = %d,\n", sec.Size)
+		if sec.Name == ".text" {
+			fmt.Fprintln(w, ".bytes_len = 0, /* No need to copy the .text section */")
+			fmt.Fprintln(w, ".bytes = {}, /* No need to copy the .text section */")
+		} else {
+			dat, err := sec.Data()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(w, ".bytes_len = %d,\n", len(dat))
+			fmt.Fprintln(w, ".bytes = {")
+			for i, b := range dat {
+				fmt.Fprintf(w, "0x%02X, ", b)
+				if i%16 == 15 {
+					fmt.Fprintln(w, "")
+				}
+			}
+			fmt.Fprintln(w, "")
+			fmt.Fprintln(w, "}, /* .bytes */ ")
+		}
+		fmt.Fprintf(w, "}; /* _ma_vma_entry_%d */\n", vmaEntryIdx)
+		fmt.Fprintln(w, "")
+		vmaEntryIdx++
 	}
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "}; /* _ma_vma */")
+	fmt.Fprintln(w, "struct _ma_vma_entry *_ma_vma_entries[] = {")
+	for i := 0; i < vmaEntryIdx; i++ {
+		fmt.Fprintf(w, "&_ma_vma_entry_%d,\n", i)
+	}
+	fmt.Fprintln(w, "NULL,")
+	fmt.Fprintln(w, "}; /* _ma_vma_entries */")
 	fmt.Fprintln(w, "")
 
 	// Generate the main state machine
