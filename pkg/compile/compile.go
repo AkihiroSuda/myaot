@@ -141,7 +141,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Addi: // addi rd,rs1,imm: x[rd] = x[rs1] + sext(immediate)
 					rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
-					fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.x[%d] + %d;\n", rd, rs1, imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %d;\n", rd, generateReadRegExpr(rs1), imm)
 				default:
 					return fmt.Errorf("unsupported funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
@@ -172,4 +172,12 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "")
 
 	return nil
+}
+
+func generateReadRegExpr(reg decoder.RegisterIndex) string {
+	if reg == 0 {
+		// Hard-wired zero
+		return "0"
+	}
+	return fmt.Sprintf("_ma_regs.x[%d]", reg)
 }
