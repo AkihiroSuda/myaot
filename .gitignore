@@ -1,1 +1,5 @@
 a.*
+
+# examples/hello-asm/hello-riscv32 is small enough to put in the repo,
+# but examples/hello-c/hello-riscv32 is too big
+examples/hello-c/hello-riscv32
