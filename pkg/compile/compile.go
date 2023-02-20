@@ -110,16 +110,16 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	fmt.Fprintln(w, "")
 
 	// Generate the main state machine
-	if err = generateMain(w, textSec); err != nil {
+	if err = generateMain(w, f, textSec); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func generateMain(w io.Writer, textSec *elf.Section) error {
+func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
-	pc := int(textSec.Addr)
+	pc := int(elfFile.Entry)
 	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", pc)
 	fmt.Fprintln(w, "for (;;) {")
 	w.Write([]byte("_MA_DEBUGF(\"PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
