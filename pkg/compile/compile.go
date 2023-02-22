@@ -84,35 +84,59 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 		if sec.Addr == 0 {
 			continue
 		}
-		fmt.Fprintf(w, "/* %+v */\n", sec.SectionHeader)
-		fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
-		fmt.Fprintf(w, ".addr = %d,\n", sec.Addr)
-		fmt.Fprintf(w, ".len = %d,\n", sec.Size)
+		var hasBytes bool
 		switch {
 		case sec.Name == ".text", sec.Type == elf.SHT_NOBITS:
-			fmt.Fprintln(w, ".bytes_len = 0,")
-			fmt.Fprintln(w, ".bytes = {},")
+			// NOP
 		default:
+			hasBytes = true
 			dat, err := sec.Data()
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(w, ".bytes_len = %d,\n", len(dat))
-			fmt.Fprintln(w, ".bytes = {")
+			fmt.Fprintf(w, "uint8_t _ma_vma_entry_%d_bytes[] = {\n", vmaEntryIdx)
 			for i, b := range dat {
 				fmt.Fprintf(w, "0x%02X, ", b)
 				if i%16 == 15 {
 					fmt.Fprintln(w, "")
 				}
 			}
-			fmt.Fprintln(w, "")
-			fmt.Fprintln(w, "}, /* .bytes */ ")
+			fmt.Fprintf(w, "}; /* _ma_vma_entry_%d_bytes */\n", vmaEntryIdx)
+		}
+		fmt.Fprintf(w, "/* %+v */\n", sec.SectionHeader)
+		fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
+		fmt.Fprintf(w, ".addr = %d,\n", sec.Addr)
+		fmt.Fprintf(w, ".len = %d,\n", sec.Size)
+		if hasBytes {
+			fmt.Fprintf(w, ".bytes = _ma_vma_entry_%d_bytes,\n", vmaEntryIdx)
 		}
 		fmt.Fprintf(w, "}; /* _ma_vma_entry_%d */\n", vmaEntryIdx)
 		fmt.Fprintln(w, "")
 		vmaEntryIdx++
 	}
 	fmt.Fprintln(w, "")
+
+	// Generate heap VMA entry
+	fmt.Fprintln(w, "/* HEAP */")
+	fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
+	fmt.Fprintln(w, "/* Fulfilled in _ma_vma_heap_entry_init() */")
+	fmt.Fprintf(w, "}; /* _ma_vma_entry_%d */\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	fmt.Fprintf(w, "struct _ma_vma_entry *_ma_vma_heap_entry = &_ma_vma_entry_%d;\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	vmaEntryIdx++
+
+	// Generate stack VMA entry
+	fmt.Fprintln(w, "/* STACK */")
+	fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
+	fmt.Fprintln(w, "/* Fulfilled in _ma_vma_stack_entry_init() */")
+	fmt.Fprintf(w, "}; /* _ma_vma_entry_%d */\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	fmt.Fprintf(w, "struct _ma_vma_entry *_ma_vma_stack_entry = &_ma_vma_entry_%d;\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	vmaEntryIdx++
+
+	// Generate VMA table
 	fmt.Fprintln(w, "struct _ma_vma_entry *_ma_vma_entries[] = {")
 	for i := 0; i < vmaEntryIdx; i++ {
 		fmt.Fprintf(w, "&_ma_vma_entry_%d,\n", i)
@@ -131,10 +155,19 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 
 func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
+	fmt.Fprintln(w, "_ma_vma_heap_entry_init();")
+	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
 	pc := int(elfFile.Entry)
 	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", pc)
+	tp := 0
+	for _, sec := range elfFile.Sections {
+		if sec.Name == ".tdata" {
+			tp = int(sec.Addr)
+		}
+	}
+	fmt.Fprintf(w, "_ma_regs.x[_MA_REG_TP]= 0x%08X;\n", tp)
 	fmt.Fprintln(w, "for (;;) {")
-	w.Write([]byte("_MA_DEBUGF(\"PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
+	fmt.Fprintln(w, "_ma_regs_dump();")
 	fmt.Fprintln(w, "/* TODO: use an explicit jump table (for non-WASM?) */")
 	fmt.Fprintln(w, "switch(_ma_regs.pc) {")
 	textReader := textSec.Open()
@@ -155,7 +188,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 			case decoder.IntRegReg:
 				rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
 				switch f7 := inst.GetFunct7(); f7 {
-				case decoder.Add: // addrd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
+				case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 				case decoder.Sub: // sub rd,rs1,rs2: x[rd] = x[rs1] - x[rs2]
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s - %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
@@ -164,30 +197,31 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				}
 			case decoder.IntRegImm:
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+				shamt := imm & 0b11111
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Addi: // addi rd,rs1,imm: x[rd] = x[rs1] + sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (signed)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Slli: // slli rd,rs1,shamt: x[rd] = x[rs1] << shamt
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %d;\n", rd, generateReadRegExpr(rs1), imm&0b11111)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %d;\n", rd, generateReadRegExpr(rs1), shamt)
 				case decoder.Sr:
 					switch f7 := inst.GetFunct7(); f7 {
 					case decoder.Srl: // srli rd,rs1,shamt: x[rd] = x[rs1] >>u shamt // logical shift
-						fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned)%s >> (unsigned)%d;\n", rd, generateReadRegExpr(rs1), imm&0b11111)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
 					case decoder.Sra: // srai rd,rs1,shamt: x[rd] = x[rs1] >>s shamt // arithmetic shift
-						fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> (signed)%d);\n", rd, generateReadRegExpr(rs1), imm&0b11111)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
 					default:
 						return fmt.Errorf("unsupported InstRegImm funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
 					}
 				case decoder.Slti: // slti rd,rs1,imm: x[rd] = x[rs1] <s sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Sltiu: // sltiu rd,rs1,imm: x[rd] = x[rs1] <u sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned) %s < (unsigned)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned) %s < (unsigned)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Andi: // andi rd,rs1,imm: x[rd] = x[rs1] & sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Xori: // xori rd,rs1,imm: x[rd] = x[rs1] ^ sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Ori: // xori rd,rs1,imm: x[rd] = x[rs1] | sext(immediate)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)%d;\n", rd, generateReadRegExpr(rs1), imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				default:
 					return fmt.Errorf("unsupported InstRegImm funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
@@ -195,20 +229,20 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)%d);\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(m_val & 0xFF);\n", rd)
+					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFF, 8);\n", rd)
 				case decoder.Lbu: // lbu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][7:0]
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)%d);\n", rs1, imm)
+					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = m_val & 0xFF;\n", rd)
 				case decoder.Lh: // lh rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][15:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)%d);\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(m_val & 0xFF);\n", rd)
+					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFFFF, 16);\n", rd)
 				case decoder.Lhu: // lhu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][15:0]
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)%d);\n", rs1, imm)
+					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = m_val & 0xFFFF;\n", rd)
 				case decoder.Lw: // lw rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][31:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)%d);\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(m_val & 0xFFFFFFFF);\n", rd)
+					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFFFFFFFF, 32);\n", rd)
 				default:
 					return fmt.Errorf("unsupported Load funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
@@ -216,11 +250,11 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Sb: // sb rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][7:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)%d) = %s & 0xFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
 				case decoder.Sh: // sh rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][15:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)%d) = %s & 0xFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
 				case decoder.Sw: // sw rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][31:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)%d) = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
 				default:
 					return fmt.Errorf("unsupported Store funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
@@ -228,35 +262,37 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Beq: // beq rs1,rs2,offset: if (x[rs1] == x[rs2]) pc += sext(offset)
-					fmt.Fprintf(w, "if (%s == %s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if (%s == %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
-					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc += (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-					fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _ma_regs.pc < (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
-				case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] >u x[rs2]) pc += sext(offset) // unsigned
-					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc > (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] <u x[rs2]) pc += sext(offset) // unsigned
+					fmt.Fprintf(w, "if (%s < %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-					fmt.Fprintf(w, "if ((signed)%s > (signed)%s) { _ma_regs.pc < (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
-					fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc >= (signed)%d; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+					fmt.Fprintf(w, "if (%s >= %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); continue; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
 				default:
 					return fmt.Errorf("unsupported Branch funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
-			case decoder.Lui: // lui rd,imm: x[rd] = sext(immediate[31:12] << 12)]
+			case decoder.Lui: // lui rd,imm: x[rd] = sext(immediate[31:12] << 12)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)(%d & 0xFFFFF000);\n", rd, imm)
-			case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)]
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(%d,32);\n", rd, imm)
+			case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)(%d & 0xFFFFF000);\n", rd, pc, imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)_MA_SIGN_EXT(%d,32);\n", rd, pc, imm)
 			case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
 				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + 4;\n", rd, pc)
-				fmt.Fprintf(w, "_ma_regs.pc += (signed)%d;\n", imm)
+				fmt.Fprintf(w, "_ma_regs.pc += (signed)_MA_SIGN_EXT(%d,21);\n", imm)
+				fmt.Fprintln(w, "continue; /* PC was modified */")
 			case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
 				fmt.Fprintf(w, "_ma_reg_t t_val = %d +4;\n", pc)
-				fmt.Fprintf(w, "_ma_regs.pc += (%s + (signed)%d)&~1;\n", generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.pc = (%s + (signed)_MA_SIGN_EXT(%d,12))&~1;\n", generateReadRegExpr(rs1), imm)
 				fmt.Fprintf(w, "_ma_regs.x[%d] = t_val;\n", rd)
+				fmt.Fprintln(w, "continue; /* PC was modified */")
 			case decoder.Sys:
 				fmt.Fprintln(w, "_ma_ecall();")
 			case decoder.FenceOp: // WIP, probably wrong

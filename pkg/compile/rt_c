@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #if defined(_MA_DEBUG)
@@ -22,8 +25,19 @@ static bool _ma_debug = true;
     abort(); \
   } while (0)
 
+#if !defined(MAX)
 #define MAX(a,b) ((a) > (b) ? a : b)
+#endif /* MAX */
+
+#if !defined(MIN)
 #define MIN(a,b) ((a) < (b) ? a : b)
+#endif /* MIN */
+
+/* _MA_SIGN_BIT(4) =  0b0000'1000 */
+#define _MA_SIGN_BIT(pos) (1LL << ((pos)-1))
+/* _MA_SIGN_MASK(4) = 0b1111'1000 */
+#define _MA_SIGN_MASK(pos) (~(_MA_SIGN_BIT((pos))-1))
+#define _MA_SIGN_EXT(val, pos) ((val) & _MA_SIGN_BIT((pos)) ? ((val) | _MA_SIGN_MASK((pos))) : (val))
 
 #if !defined(_MA_REG_TYPE)
 #define _MA_REG_TYPE uint32_t
@@ -33,7 +47,7 @@ typedef _MA_REG_TYPE _ma_reg_t;
 #define _MA_REG_ZERO 0 /* Hard-wired zero */
 #define _MA_REG_RA 1 /* Return address */
 #define _MA_REG_SP 2 /* Stack pointer */
-#define _MA_REG_GP 3 /* GLobal pointer */
+#define _MA_REG_GP 3 /* Global pointer */
 #define _MA_REG_TP 4 /* Thread pointer */
 #define _MA_REG_T0 5 /* Temporary / alternate link register */
 #define _MA_REG_T1 6
@@ -71,36 +85,88 @@ struct _ma_regs {
 
 struct _ma_regs _ma_regs;
 
+
+void _ma_regs_dump(void) {
+  _MA_DEBUGF("=== PC=%08X ===", _ma_regs.pc);
+  _MA_DEBUGF("X0=%08X X1(RA)=%08X X2(SP)=%08X X3(GP)=%08X X4(TP)=%08X X5(T0)=%08X X6=%08X X7=%08X",
+      _ma_regs.x[0], _ma_regs.x[1], _ma_regs.x[2], _ma_regs.x[3], _ma_regs.x[4], _ma_regs.x[5], _ma_regs.x[6], _ma_regs.x[7]);
+  _MA_DEBUGF("X8(S0/FP)=%08X X9(S1)=%08X X10(A0)=%08X X11=%08X X12=%08X, X13=%08X, X14=%08X, X15=%08X",
+      _ma_regs.x[8], _ma_regs.x[9], _ma_regs.x[10], _ma_regs.x[11], _ma_regs.x[12], _ma_regs.x[13], _ma_regs.x[14], _ma_regs.x[15]);
+  _MA_DEBUGF("X16=%08X X17=%08X X18(S2)=%08X X19=%08X X20=%08X X21=%08X X22=%08X X23=%08X",
+      _ma_regs.x[16], _ma_regs.x[17], _ma_regs.x[18], _ma_regs.x[19], _ma_regs.x[20], _ma_regs.x[21], _ma_regs.x[22], _ma_regs.x[23]);
+  _MA_DEBUGF("X24=%08X X25=%08X X26=%08X X27=%08X X28(T3)=%08X X29=%08X X30=%08X X31=%08X",
+      _ma_regs.x[24], _ma_regs.x[25], _ma_regs.x[26], _ma_regs.x[27], _ma_regs.x[28], _ma_regs.x[29], _ma_regs.x[30], _ma_regs.x[31]);
+}
+
 struct _ma_vma_entry {
   _ma_reg_t addr;
   _ma_reg_t len;
-  _ma_reg_t bytes_len; /* Optional */
-  uint8_t bytes[]; /* Optional */
+  void *bytes; /* Optional */
 } _ma_vma_entry;
 
 struct _ma_vma_entry *_ma_vma_entries[];
+struct _ma_vma_entry *_ma_vma_heap_entry;
+struct _ma_vma_entry *_ma_vma_stack_entry;
+_ma_reg_t _ma_vma_heap_cur;
+
+void _ma_vma_heap_entry_init(void) {
+  _ma_vma_heap_entry->addr = 0x40000000; /* 1GiB */ /* FIXME */
+  _ma_vma_heap_cur = _ma_vma_heap_entry->addr;
+  _ma_vma_heap_entry->len = 1 * 1024 * 1024 * 1024; /* 1 GiB */ /* FIXME */
+  _MA_DEBUGF("Heap begin=0x%X len=0x%x", _ma_vma_heap_entry->addr, _ma_vma_heap_entry->len);
+  _ma_vma_heap_entry->bytes = malloc(_ma_vma_heap_entry->len);
+}
+
+void _ma_vma_stack_entry_init(int argc, char *argv[]) {
+  _ma_reg_t argc_dummy = 1; /* FIXME: proper argc */
+  _ma_reg_t sp;
+  _ma_vma_stack_entry->addr = 0xc0000000; /* 3 GiB */ /* FIXME */
+  _ma_vma_stack_entry->len = 4 * 1024 * 1024; /* 4 MiB */ /* FIXME */
+  _MA_DEBUGF("Stack begin=0x%X len=0x%x", _ma_vma_stack_entry->addr, _ma_vma_stack_entry->len);
+  _ma_vma_stack_entry->bytes = malloc(_ma_vma_stack_entry->len);
+  memset(_ma_vma_stack_entry->bytes, 0, _ma_vma_stack_entry->len);
+  /* Initialize the stack */
+  sp = _ma_vma_stack_entry->addr + _ma_vma_stack_entry->len;
+	_ma_regs.x[_MA_REG_FP]= sp;
+  /* TODO: auxv */
+  /* At least AT_RANDOM(25) is needed for glibc https://stackoverflow.com/a/37749232/5167443 */
+  sp -= sizeof(_ma_reg_t) * 32;
+  /* TODO: envp */
+  sp -= sizeof(_ma_reg_t) * 32;
+  /* TODO: argv */
+  sp -= sizeof(_ma_reg_t) * 32;
+  /* TODO: argc */
+  sp -= sizeof(_ma_reg_t);
+  memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, &argc_dummy, sizeof(_ma_reg_t));
+	_ma_regs.x[_MA_REG_SP]= sp;
+}
 
 void* _ma_translate_ptr(_ma_reg_t r) {
+  void *ret = (void*)(long)r;
   int i = 0;
   for (;;) {
     struct _ma_vma_entry *ent = _ma_vma_entries[i];
     if (ent == NULL) break;
     if (ent->addr <= r && r <= ent->addr + ent->len -1) {
-      if (ent->bytes_len == 0) {
-        _MA_FATALF("Unmapped VMA address 0x%08X", r);
-        return NULL;
+      if (ent->bytes == NULL) {
+        _MA_DEBUGF("Mapping VMA address 0x%08X", r);
+        ent->bytes = malloc(ent->len);
+        memset(ent->bytes, 0, ent->len);
       }
-      return &ent->bytes[r - ent->addr];
+      ret = ent->bytes + r - ent->addr;
+      break;
     }
     i++;
   }
-  return (void*)(long)r;
+  _MA_DEBUGF("_ma_translate_ptr(0x%08X) --> 0x%08llX", r, (long long)ret);
+  return ret;
 }
 
 void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
       _ma_regs.x[_MA_REG_A7],
       _ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2], _ma_regs.x[_MA_REG_A3], _ma_regs.x[_MA_REG_A4], _ma_regs.x[_MA_REG_A5]);
+  errno = 0;
   /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
   switch (_ma_regs.x[_MA_REG_A7]){
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
@@ -109,8 +175,45 @@ void _ma_ecall(void) {
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
       break;
+    case 172: /* asmlinkage long sys_getpid(void); */
+      _ma_regs.x[_MA_REG_A0] = getpid();
+      break;
+    case 173: /* asmlinkage long sys_getppid(void); */
+      _ma_regs.x[_MA_REG_A0] = getppid();
+      break;
+    case 174: /* asmlinkage long sys_getuid(void); */
+      _ma_regs.x[_MA_REG_A0] = getuid();
+      break;
+    case 175: /* asmlinkage long sys_geteuid(void); */
+      _ma_regs.x[_MA_REG_A0] = geteuid();
+      break;
+    case 176: /* asmlinkage long sys_getgid(void); */
+      _ma_regs.x[_MA_REG_A0] = getgid();
+      break;
+    case 177: /* asmlinkage long sys_getegid(void); */
+      _ma_regs.x[_MA_REG_A0] = getegid();
+      break;
+    case 178: /* asmlinkage long sys_gettid(void); */
+#if defined(__linux__)
+      _ma_regs.x[_MA_REG_A0] = gettid();
+#else
+      _ma_regs.x[_MA_REG_A0] = 0; /* STUB */
+#endif /* __linux__ */
+      break;
+    case 214: /* asmlinkage long sys_brk(unsigned long brk); */
+      if (_ma_regs.x[_MA_REG_A0] == 0) {
+        _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
+      } else if (_ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
+        _ma_vma_heap_cur = _ma_regs.x[_MA_REG_A0];
+      } else {
+        _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
+      }
+      break;
     default:
       _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
       break;
+  }
+  if (errno != 0) {
+    _ma_regs.x[_MA_REG_A1] = errno;
   }
 }

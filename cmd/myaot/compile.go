@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/AkihiroSuda/myaot/pkg/ccutil"
 	"github.com/AkihiroSuda/myaot/pkg/compile"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -64,9 +65,9 @@ func compileAction(cmd *cobra.Command, args []string) error {
 
 	if !outIsC {
 		logrus.Infof("Compiling %s --> %s", outCPath, outFilePath)
-		cc := os.Getenv("CC")
-		if cc == "" {
-			cc = "cc"
+		cc, err := ccutil.CC()
+		if err != nil {
+			return err
 		}
 		ccCmd := exec.Command(cc, "-O3", "-o", outFilePath, outCPath)
 		ccCmd.Stdout = os.Stdout
