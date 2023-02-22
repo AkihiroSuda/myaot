@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -103,13 +105,23 @@ struct _ma_vma_entry {
 } _ma_vma_entry;
 
 struct _ma_vma_entry *_ma_vma_entries[];
+struct _ma_vma_entry *_ma_vma_heap_entry;
 struct _ma_vma_entry *_ma_vma_stack_entry;
+_ma_reg_t _ma_vma_heap_cur;
+
+void _ma_vma_heap_entry_init(void) {
+  _ma_vma_heap_entry->addr = 0x40000000; /* 1GiB */ /* FIXME */
+  _ma_vma_heap_cur = _ma_vma_heap_entry->addr;
+  _ma_vma_heap_entry->len = 1 * 1024 * 1024 * 1024; /* 1 GiB */ /* FIXME */
+  _MA_DEBUGF("Heap begin=0x%X len=0x%x", _ma_vma_heap_entry->addr, _ma_vma_heap_entry->len);
+  _ma_vma_heap_entry->bytes = malloc(_ma_vma_heap_entry->len);
+}
 
 void _ma_vma_stack_entry_init(int argc, char *argv[]) {
   _ma_reg_t argc_dummy = 1; /* FIXME: proper argc */
   _ma_reg_t sp;
-  _ma_vma_stack_entry->addr = 0xc0000000; /* FIXME */
-  _ma_vma_stack_entry->len = 4 * 1024 * 1024; /* FIXME */
+  _ma_vma_stack_entry->addr = 0xc0000000; /* 3 GiB */ /* FIXME */
+  _ma_vma_stack_entry->len = 4 * 1024 * 1024; /* 4 MiB */ /* FIXME */
   _MA_DEBUGF("Stack begin=0x%X len=0x%x", _ma_vma_stack_entry->addr, _ma_vma_stack_entry->len);
   _ma_vma_stack_entry->bytes = malloc(_ma_vma_stack_entry->len);
   memset(_ma_vma_stack_entry->bytes, 0, _ma_vma_stack_entry->len);
@@ -117,6 +129,7 @@ void _ma_vma_stack_entry_init(int argc, char *argv[]) {
   sp = _ma_vma_stack_entry->addr + _ma_vma_stack_entry->len;
 	_ma_regs.x[_MA_REG_FP]= sp;
   /* TODO: auxv */
+  /* At least AT_RANDOM(25) is needed for glibc https://stackoverflow.com/a/37749232/5167443 */
   sp -= sizeof(_ma_reg_t) * 32;
   /* TODO: envp */
   sp -= sizeof(_ma_reg_t) * 32;
@@ -153,6 +166,7 @@ void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
       _ma_regs.x[_MA_REG_A7],
       _ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2], _ma_regs.x[_MA_REG_A3], _ma_regs.x[_MA_REG_A4], _ma_regs.x[_MA_REG_A5]);
+  errno = 0;
   /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
   switch (_ma_regs.x[_MA_REG_A7]){
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
@@ -161,8 +175,45 @@ void _ma_ecall(void) {
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
       break;
+    case 172: /* asmlinkage long sys_getpid(void); */
+      _ma_regs.x[_MA_REG_A0] = getpid();
+      break;
+    case 173: /* asmlinkage long sys_getppid(void); */
+      _ma_regs.x[_MA_REG_A0] = getppid();
+      break;
+    case 174: /* asmlinkage long sys_getuid(void); */
+      _ma_regs.x[_MA_REG_A0] = getuid();
+      break;
+    case 175: /* asmlinkage long sys_geteuid(void); */
+      _ma_regs.x[_MA_REG_A0] = geteuid();
+      break;
+    case 176: /* asmlinkage long sys_getgid(void); */
+      _ma_regs.x[_MA_REG_A0] = getgid();
+      break;
+    case 177: /* asmlinkage long sys_getegid(void); */
+      _ma_regs.x[_MA_REG_A0] = getegid();
+      break;
+    case 178: /* asmlinkage long sys_gettid(void); */
+#if defined(__linux__)
+      _ma_regs.x[_MA_REG_A0] = gettid();
+#else
+      _ma_regs.x[_MA_REG_A0] = 0; /* STUB */
+#endif /* __linux__ */
+      break;
+    case 214: /* asmlinkage long sys_brk(unsigned long brk); */
+      if (_ma_regs.x[_MA_REG_A0] == 0) {
+        _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
+      } else if (_ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
+        _ma_vma_heap_cur = _ma_regs.x[_MA_REG_A0];
+      } else {
+        _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
+      }
+      break;
     default:
       _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
       break;
+  }
+  if (errno != 0) {
+    _ma_regs.x[_MA_REG_A1] = errno;
   }
 }

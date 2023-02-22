@@ -116,6 +116,16 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	}
 	fmt.Fprintln(w, "")
 
+	// Generate heap VMA entry
+	fmt.Fprintln(w, "/* HEAP */")
+	fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
+	fmt.Fprintln(w, "/* Fulfilled in _ma_vma_heap_entry_init() */")
+	fmt.Fprintf(w, "}; /* _ma_vma_entry_%d */\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	fmt.Fprintf(w, "struct _ma_vma_entry *_ma_vma_heap_entry = &_ma_vma_entry_%d;\n", vmaEntryIdx)
+	fmt.Fprintln(w, "")
+	vmaEntryIdx++
+
 	// Generate stack VMA entry
 	fmt.Fprintln(w, "/* STACK */")
 	fmt.Fprintf(w, "struct _ma_vma_entry _ma_vma_entry_%d = {\n", vmaEntryIdx)
@@ -145,6 +155,7 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 
 func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
+	fmt.Fprintln(w, "_ma_vma_heap_entry_init();")
 	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
 	pc := int(elfFile.Entry)
 	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", pc)
