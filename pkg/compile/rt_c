@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/random.h>
+#endif /* __APPLE__ */
 
 #if defined(_MA_DEBUG)
 static bool _ma_debug = true;
@@ -109,6 +112,9 @@ struct _ma_vma_entry *_ma_vma_heap_entry;
 struct _ma_vma_entry *_ma_vma_stack_entry;
 _ma_reg_t _ma_vma_heap_cur;
 
+uint8_t _ma_at_ph[];
+_ma_reg_t _ma_at_phent, _ma_at_phnum, _ma_at_entry;
+
 void _ma_vma_heap_entry_init(void) {
   _ma_vma_heap_entry->addr = 0x40000000; /* 1GiB */ /* FIXME */
   _ma_vma_heap_cur = _ma_vma_heap_entry->addr;
@@ -128,17 +134,51 @@ void _ma_vma_stack_entry_init(int argc, char *argv[]) {
   /* Initialize the stack */
   sp = _ma_vma_stack_entry->addr + _ma_vma_stack_entry->len;
 	_ma_regs.x[_MA_REG_FP]= sp;
-  /* TODO: auxv */
-  /* At least AT_RANDOM(25) is needed for glibc https://stackoverflow.com/a/37749232/5167443 */
-  sp -= sizeof(_ma_reg_t) * 32;
+
+  /* Initialize AT_RANDOM */
+  /* FIXME: this shouldn't be on the stack? */
+  sp -= 16;
+  getentropy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, 16);
+  _ma_reg_t randomp = sp;
+
+  /* Initialize AT_PHDR */
+  /* FIXME: this shouldn't be on the stack? */
+  sp -= _ma_at_phent * _ma_at_phnum;
+  memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, _ma_at_ph, _ma_at_phent * _ma_at_phnum);
+  _ma_reg_t phdr = sp;
+
+  /* Initialize auxv */
+  struct {
+    _ma_reg_t k;
+    _ma_reg_t v;
+  } auxv[] = {
+    {3 /* AT_PHDR */, phdr},
+    {4 /* AT_PHENT */, _ma_at_phent},
+    {5 /* AT_PHNUM */, _ma_at_phnum},
+    {6 /* AT_PAGESZ */, 4096},
+    {9 /* AT_ENTRY */, _ma_at_entry},
+    {11 /* AT_UID */, getuid()},
+    {12 /* AT_EUID */, geteuid()},
+    {13 /* AT_GID */, getgid()},
+    {14 /* AT_EGID */, getegid()},
+    {23 /* AT_SECURE */, 0},
+    {25 /* AT_RANDOM */, randomp},
+    {0 /* AT_NULL */, 0},
+  };
+  sp -= sizeof(auxv);
+  memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, auxv, sizeof(auxv));
+
   /* TODO: envp */
-  sp -= sizeof(_ma_reg_t) * 32;
+  sp -= sizeof(_ma_reg_t);
+
   /* TODO: argv */
-  sp -= sizeof(_ma_reg_t) * 32;
+  sp -= sizeof(_ma_reg_t) * (argc_dummy + 1);
+
   /* TODO: argc */
   sp -= sizeof(_ma_reg_t);
   memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, &argc_dummy, sizeof(_ma_reg_t));
-	_ma_regs.x[_MA_REG_SP]= sp;
+
+  _ma_regs.x[_MA_REG_SP]= sp;
 }
 
 void* _ma_translate_ptr(_ma_reg_t r) {

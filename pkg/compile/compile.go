@@ -78,6 +78,11 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	io.Copy(w, bytes.NewReader(rtC))
 	fmt.Fprintln(w, "")
 
+	// Generate AT_PHDR
+	if err = generatePH(w, r, f); err != nil {
+		return err
+	}
+
 	// Generate VMA entries
 	vmaEntryIdx := 0
 	for _, sec := range f.Sections {
@@ -153,19 +158,61 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	return nil
 }
 
+func generatePH(w io.Writer, r io.ReaderAt, elfFile *elf.File) error {
+	sr := io.NewSectionReader(r, 0, 1<<63-1)
+	if _, err := sr.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	var (
+		phent, phnum int
+		phoff        int64
+	)
+	switch elfFile.Class {
+	case elf.ELFCLASS32:
+		var hdr elf.Header32
+		if err := binary.Read(sr, elfFile.ByteOrder, &hdr); err != nil {
+			return err
+		}
+		phent, phnum, phoff = int(hdr.Phentsize), int(hdr.Phnum), int64(hdr.Phoff)
+	case elf.ELFCLASS64:
+		var hdr elf.Header64
+		if err := binary.Read(sr, elfFile.ByteOrder, &hdr); err != nil {
+			return err
+		}
+		phent, phnum, phoff = int(hdr.Phentsize), int(hdr.Phnum), int64(hdr.Phoff)
+	default:
+		return fmt.Errorf("unsupported ELF class %+v", elfFile.Class)
+	}
+	fmt.Fprintf(w, "_ma_reg_t _ma_at_phent=%d;\n", phent)
+	fmt.Fprintf(w, "_ma_reg_t _ma_at_phnum=%d;\n", phnum)
+	fmt.Fprintf(w, "_ma_reg_t _ma_at_entry=%d;\n", elfFile.Entry)
+	fmt.Fprintln(w, "uint8_t _ma_at_ph[] = {")
+	phSz := phent * phnum
+	ph := make([]byte, phSz)
+	n, err := r.ReadAt(ph, phoff)
+	if err != nil {
+		return err
+	}
+	if n != phSz {
+		return errors.New("partial PH")
+	}
+	for i, b := range ph {
+		fmt.Fprintf(w, "0x%02X, ", b)
+		if i%16 == 15 {
+			fmt.Fprintln(w, "")
+		}
+	}
+	fmt.Fprintln(w, "}; /* _ma_at_ph */")
+	fmt.Fprintln(w, "")
+	return nil
+}
+
 func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
 	fmt.Fprintln(w, "_ma_vma_heap_entry_init();")
 	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
 	pc := int(elfFile.Entry)
 	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", pc)
-	tp := 0
-	for _, sec := range elfFile.Sections {
-		if sec.Name == ".tdata" {
-			tp = int(sec.Addr)
-		}
-	}
-	fmt.Fprintf(w, "_ma_regs.x[_MA_REG_TP]= 0x%08X;\n", tp)
 	fmt.Fprintln(w, "for (;;) {")
 	fmt.Fprintln(w, "_ma_regs_dump();")
 	fmt.Fprintln(w, "/* TODO: use an explicit jump table (for non-WASM?) */")
