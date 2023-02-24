@@ -141,9 +141,10 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	fmt.Fprintln(w, "")
 	vmaEntryIdx++
 
-	// Generate VMA table
+	// Generate VMA table in the descending order,
+	// to support overwrapping https://stackoverflow.com/questions/25501044/gcc-ld-overlapping-sections-tbss-init-array-in-statically-linked-elf-bin
 	fmt.Fprintln(w, "struct _ma_vma_entry *_ma_vma_entries[] = {")
-	for i := 0; i < vmaEntryIdx; i++ {
+	for i := vmaEntryIdx - 1; i >= 0; i-- {
 		fmt.Fprintf(w, "&_ma_vma_entry_%d,\n", i)
 	}
 	fmt.Fprintln(w, "NULL,")
