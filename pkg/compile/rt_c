@@ -202,6 +202,8 @@ void* _ma_translate_ptr(_ma_reg_t r) {
   return ret;
 }
 
+#define _MA_EACCESS 13
+
 void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
       _ma_regs.x[_MA_REG_A7],
@@ -209,8 +211,18 @@ void _ma_ecall(void) {
   errno = 0;
   /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
   switch (_ma_regs.x[_MA_REG_A7]){
+    case 48: /* asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_EACCESS;
+      break;
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
       _ma_regs.x[_MA_REG_A0] = write((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
+      break;
+    case 78: /* asmlinkage long sys_readlinkat(int dfd, const char __user *path, char __user *buf, int bufsiz); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_EACCESS;
       break;
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
@@ -273,6 +285,10 @@ void _ma_ecall(void) {
       } else {
         _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
       }
+      break;
+    case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = 0;
       break;
     default:
       _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
