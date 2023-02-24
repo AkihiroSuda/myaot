@@ -237,13 +237,39 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				if rd == 0 {
 					break
 				}
-				switch f7 := inst.GetFunct7(); f7 {
-				case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-				case decoder.Sub: // sub rd,rs1,rs2: x[rd] = x[rs1] - x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s - %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				switch f3 := inst.GetFunct3(); f3 {
+				case decoder.RegDiff:
+					switch f7 := inst.GetFunct7(); f7 {
+					case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					case decoder.Sub: // sub rd,rs1,rs2: x[rd] = x[rs1] - x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = %s - %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					default:
+						return fmt.Errorf("unsupported RegReg funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
+					}
+				case decoder.Sll: // sll rd,rs1,rs2: x[rd] = x[rs1] << x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Slt: // slt rd,rs1,rs2: x[rd] = x[rs1] <s x[rs2]:
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Sltu: // sltu rd,rs1,rs2: x[rd] = x[rs1] <u x[rs2]:
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s < %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Xor: // xor rd,rs1,rs2: x[rd] = x[rs1] ^ x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.RegShift:
+					switch f7 := inst.GetFunct7(); f7 {
+					case decoder.Srl: // srl rd,rs1,rs2: x[rd] = x[rs1] >>u x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> %s & 0x1f);\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					case decoder.Sra: // sra rd,rs1,rs2: x[rd] = x[rs1] >>s x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> %s & 0x1f);\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					default:
+						return fmt.Errorf("unsupported RegReg funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
+					}
+				case decoder.Or: // or rd,rs1,rs2: x[rd] = x[rs1] | x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s | %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.And: // and rd,rs1,rs2: x[rd] = x[rs1] & x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s & %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 				default:
-					return fmt.Errorf("unsupported RegReg funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
+					return fmt.Errorf("unsupported RegReg funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
 			case decoder.IntRegImm:
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
@@ -263,7 +289,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 					case decoder.Sra: // srai rd,rs1,shamt: x[rd] = x[rs1] >>s shamt // arithmetic shift
 						fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
 					default:
-						return fmt.Errorf("unsupported InstRegImm funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
+						return fmt.Errorf("unsupported IntRegImm funct7 %+v (PC=0x%08X, instruction=0x%08X)", f7, pc, inst32)
 					}
 				case decoder.Slti: // slti rd,rs1,imm: x[rd] = x[rs1] <s sext(immediate)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
@@ -273,10 +299,10 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				case decoder.Xori: // xori rd,rs1,imm: x[rd] = x[rs1] ^ sext(immediate)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
-				case decoder.Ori: // xori rd,rs1,imm: x[rd] = x[rs1] | sext(immediate)
+				case decoder.Ori: // ori rd,rs1,imm: x[rd] = x[rs1] | sext(immediate)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
 				default:
-					return fmt.Errorf("unsupported InstRegImm funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
+					return fmt.Errorf("unsupported IntRegImm funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
 			case decoder.Load:
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
