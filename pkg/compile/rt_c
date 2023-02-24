@@ -267,7 +267,8 @@ void _ma_ecall(void) {
     case 214: /* asmlinkage long sys_brk(unsigned long brk); */
       if (_ma_regs.x[_MA_REG_A0] == 0) {
         _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
-      } else if (_ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
+      } else if (_ma_vma_heap_entry->addr <= _ma_regs.x[_MA_REG_A0] &&
+          _ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
         _ma_vma_heap_cur = _ma_regs.x[_MA_REG_A0];
       } else {
         _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
