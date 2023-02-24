@@ -283,34 +283,44 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				if rd == 0 {
 					break
 				}
+				fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFF, 8);\n", rd)
+					fmt.Fprintln(w, "uint8_t x;")
+					fmt.Fprintln(w, "memcpy(&x, p, 1);")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 8);\n", rd)
 				case decoder.Lbu: // lbu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][7:0]
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = m_val & 0xFF;\n", rd)
+					fmt.Fprintln(w, "uint8_t x;")
+					fmt.Fprintln(w, "memcpy(&x, p, 1);")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
 				case decoder.Lh: // lh rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][15:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFFFF, 16);\n", rd)
+					fmt.Fprintln(w, "uint16_t x;")
+					fmt.Fprintln(w, "memcpy(&x, p, 2);")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 16);\n", rd)
 				case decoder.Lhu: // lhu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][15:0]
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = m_val & 0xFFFF;\n", rd)
+					fmt.Fprintln(w, "uint16_t x;")
+					fmt.Fprintln(w, "memcpy(&x, p, 2);")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
 				case decoder.Lw: // lw rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][31:0])
-					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
-					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(m_val & 0xFFFFFFFF, 32);\n", rd)
+					fmt.Fprintln(w, "uint32_t x;")
+					fmt.Fprintln(w, "memcpy(&x, p, 4);")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 32);\n", rd)
 				default:
 					return fmt.Errorf("unsupported Load funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
 			case decoder.Store:
 				rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
+				fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Sb: // sb rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][7:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "uint8_t x = %s & 0xFF;\n", generateReadRegExpr(rs2))
+					fmt.Fprintln(w, "memcpy(p, &x, 1);")
 				case decoder.Sh: // sh rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][15:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "uint16_t x = %s & 0xFFFF;\n", generateReadRegExpr(rs2))
+					fmt.Fprintln(w, "memcpy(p, &x, 2);")
 				case decoder.Sw: // sw rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][31:0]]
-					fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12)) = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs1), imm, generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "uint32_t x = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs2))
+					fmt.Fprintln(w, "memcpy(p, &x, 4);")
 				default:
 					return fmt.Errorf("unsupported Store funct3 %+v (PC=0x%08X, instruction=0x%08X)", f3, pc, inst32)
 				}
