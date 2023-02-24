@@ -215,6 +215,30 @@ void _ma_ecall(void) {
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
       break;
+    case 160: /* asmlinkage long sys_newuname(struct new_utsname __user *name); */
+      {
+        struct {
+          char sysname[65];
+          char nodename[65];
+          char release[65];
+          char version[65];
+          char machine[65];
+          char domainname[65];
+        } u = {
+          .sysname = "Linux",
+          .nodename = "myaot",
+          .release = "6.0.0-0-myaot",
+          .version = "#0-MyAOT",
+#if _MA_REG_TYPE == uint32_t
+          .machine = "riscv32",
+#else
+          .machine = "riscv64",
+#endif
+        };
+        memcpy(_ma_translate_ptr(_ma_regs.x[_MA_REG_A0]), &u, sizeof(u));
+        _ma_regs.x[_MA_REG_A0] = 0;
+      }
+      break;
     case 172: /* asmlinkage long sys_getpid(void); */
       _ma_regs.x[_MA_REG_A0] = getpid();
       break;
