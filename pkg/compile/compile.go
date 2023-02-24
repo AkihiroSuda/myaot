@@ -234,6 +234,9 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 			switch minorOp := inst.GetMinorOpcode(); minorOp {
 			case decoder.IntRegReg:
 				rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
+				if rd == 0 {
+					break
+				}
 				switch f7 := inst.GetFunct7(); f7 {
 				case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
 					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
@@ -244,6 +247,9 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				}
 			case decoder.IntRegImm:
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+				if rd == 0 {
+					break
+				}
 				shamt := imm & 0b11111
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Addi: // addi rd,rs1,imm: x[rd] = x[rs1] + sext(immediate)
@@ -274,6 +280,9 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				}
 			case decoder.Load:
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+				if rd == 0 {
+					break
+				}
 				switch f3 := inst.GetFunct3(); f3 {
 				case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
 					fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(_ma_regs.x[%d] + (signed)_MA_SIGN_EXT(%d,12));\n", rs1, imm)
@@ -325,20 +334,32 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 				}
 			case decoder.Lui: // lui rd,imm: x[rd] = sext(immediate[31:12] << 12)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
+				if rd == 0 {
+					break
+				}
 				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(%d,32);\n", rd, imm)
 			case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
+				if rd == 0 {
+					break
+				}
 				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)_MA_SIGN_EXT(%d,32);\n", rd, pc, imm)
 			case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 				rd, imm := inst.GetRd(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %d + 4;\n", rd, pc)
+				if rd != 0 {
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %d + 4;\n", rd, pc)
+				}
 				fmt.Fprintf(w, "_ma_regs.pc += (signed)_MA_SIGN_EXT(%d,21);\n", imm)
 				fmt.Fprintln(w, "continue; /* PC was modified */")
 			case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 				rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
-				fmt.Fprintf(w, "_ma_reg_t t_val = %d +4;\n", pc)
+				if rd != 0 {
+					fmt.Fprintf(w, "_ma_reg_t t_val = %d +4;\n", pc)
+				}
 				fmt.Fprintf(w, "_ma_regs.pc = (%s + (signed)_MA_SIGN_EXT(%d,12))&~1;\n", generateReadRegExpr(rs1), imm)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = t_val;\n", rd)
+				if rd != 0 {
+					fmt.Fprintf(w, "_ma_regs.x[%d] = t_val;\n", rd)
+				}
 				fmt.Fprintln(w, "continue; /* PC was modified */")
 			case decoder.Sys:
 				fmt.Fprintln(w, "_ma_ecall();")
@@ -353,32 +374,46 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 						switch f5tail {
 						case decoder.ArithAtomic: // amoadd.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] + x[rs2])
 							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
+							if rd == 0 {
+								break
+							}
 							fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
 							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val + %s\n;", rd, generateReadRegExpr(rs2))
 						case decoder.Amoswap: // amoswap.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] SWAP x[rs2])
 							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
 							fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
-							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+							if rd != 0 {
+								fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+							}
 							fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 						case decoder.Lr: // lr.w rd,rs1: x[rd] = LoadReserved32(M[x[rs1]])
 							rd, rs1 := inst.GetRd(), inst.GetRs1()
+							if rd == 0 {
+								break
+							}
 							fmt.Fprintf(w, "_ma_regs.x[%d] = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", rd, generateReadRegExpr(rs1))
 						case decoder.Sc: // sc.w rd,rs1,rs2: x[rd] = StoreConditional32(M[x[rs1]], x[rs2])
 							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
 							fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-							fmt.Fprintf(w, "_ma_regs.x[%d] = 0;\n", rd)
+							if rd != 0 {
+								fmt.Fprintf(w, "_ma_regs.x[%d] = 0;\n", rd)
+							}
 						default:
 							return fmt.Errorf("unsupported Atomic32 CommonAtomic funct5tail %+v (PC=0x%08X, instruction=0x%08X)", f5tail, pc, inst32)
 						}
 					case decoder.Amoor: // amoor.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] | x[rs2])
 						rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
 						fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
-						fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+						if rd != 0 {
+							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+						}
 						fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = m_val | %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 					case decoder.Amomaxu: // amomaxu.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] MAXU x[rs2])
 						rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
 						fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
-						fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+						if rd != 0 {
+							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+						}
 						fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = MAX(m_val, %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 					default:
 						return fmt.Errorf("unsupported Atomic32 funct5head %+v (PC=0x%08X, instruction=0x%08X)", f5head, pc, inst32)
