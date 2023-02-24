@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/random.h>
+#endif /* __APPLE__ */
 
 #if defined(_MA_DEBUG)
 static bool _ma_debug = true;
@@ -109,6 +112,9 @@ struct _ma_vma_entry *_ma_vma_heap_entry;
 struct _ma_vma_entry *_ma_vma_stack_entry;
 _ma_reg_t _ma_vma_heap_cur;
 
+uint8_t _ma_at_ph[];
+_ma_reg_t _ma_at_phent, _ma_at_phnum, _ma_at_entry;
+
 void _ma_vma_heap_entry_init(void) {
   _ma_vma_heap_entry->addr = 0x40000000; /* 1GiB */ /* FIXME */
   _ma_vma_heap_cur = _ma_vma_heap_entry->addr;
@@ -128,17 +134,51 @@ void _ma_vma_stack_entry_init(int argc, char *argv[]) {
   /* Initialize the stack */
   sp = _ma_vma_stack_entry->addr + _ma_vma_stack_entry->len;
 	_ma_regs.x[_MA_REG_FP]= sp;
-  /* TODO: auxv */
-  /* At least AT_RANDOM(25) is needed for glibc https://stackoverflow.com/a/37749232/5167443 */
-  sp -= sizeof(_ma_reg_t) * 32;
+
+  /* Initialize AT_RANDOM */
+  /* FIXME: this shouldn't be on the stack? */
+  sp -= 16;
+  getentropy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, 16);
+  _ma_reg_t randomp = sp;
+
+  /* Initialize AT_PHDR */
+  /* FIXME: this shouldn't be on the stack? */
+  sp -= _ma_at_phent * _ma_at_phnum;
+  memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, _ma_at_ph, _ma_at_phent * _ma_at_phnum);
+  _ma_reg_t phdr = sp;
+
+  /* Initialize auxv */
+  struct {
+    _ma_reg_t k;
+    _ma_reg_t v;
+  } auxv[] = {
+    {3 /* AT_PHDR */, phdr},
+    {4 /* AT_PHENT */, _ma_at_phent},
+    {5 /* AT_PHNUM */, _ma_at_phnum},
+    {6 /* AT_PAGESZ */, 4096},
+    {9 /* AT_ENTRY */, _ma_at_entry},
+    {11 /* AT_UID */, getuid()},
+    {12 /* AT_EUID */, geteuid()},
+    {13 /* AT_GID */, getgid()},
+    {14 /* AT_EGID */, getegid()},
+    {23 /* AT_SECURE */, 0},
+    {25 /* AT_RANDOM */, randomp},
+    {0 /* AT_NULL */, 0},
+  };
+  sp -= sizeof(auxv);
+  memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, auxv, sizeof(auxv));
+
   /* TODO: envp */
-  sp -= sizeof(_ma_reg_t) * 32;
+  sp -= sizeof(_ma_reg_t);
+
   /* TODO: argv */
-  sp -= sizeof(_ma_reg_t) * 32;
+  sp -= sizeof(_ma_reg_t) * (argc_dummy + 1);
+
   /* TODO: argc */
   sp -= sizeof(_ma_reg_t);
   memcpy(_ma_vma_stack_entry->bytes + sp - _ma_vma_stack_entry->addr, &argc_dummy, sizeof(_ma_reg_t));
-	_ma_regs.x[_MA_REG_SP]= sp;
+
+  _ma_regs.x[_MA_REG_SP]= sp;
 }
 
 void* _ma_translate_ptr(_ma_reg_t r) {
@@ -162,6 +202,8 @@ void* _ma_translate_ptr(_ma_reg_t r) {
   return ret;
 }
 
+#define _MA_EACCESS 13
+
 void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
       _ma_regs.x[_MA_REG_A7],
@@ -169,11 +211,45 @@ void _ma_ecall(void) {
   errno = 0;
   /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
   switch (_ma_regs.x[_MA_REG_A7]){
+    case 48: /* asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_EACCESS;
+      break;
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
       _ma_regs.x[_MA_REG_A0] = write((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
       break;
+    case 78: /* asmlinkage long sys_readlinkat(int dfd, const char __user *path, char __user *buf, int bufsiz); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_EACCESS;
+      break;
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
+      break;
+    case 160: /* asmlinkage long sys_newuname(struct new_utsname __user *name); */
+      {
+        struct {
+          char sysname[65];
+          char nodename[65];
+          char release[65];
+          char version[65];
+          char machine[65];
+          char domainname[65];
+        } u = {
+          .sysname = "Linux",
+          .nodename = "myaot",
+          .release = "6.0.0-0-myaot",
+          .version = "#0-MyAOT",
+#if _MA_REG_TYPE == uint32_t
+          .machine = "riscv32",
+#else
+          .machine = "riscv64",
+#endif
+        };
+        memcpy(_ma_translate_ptr(_ma_regs.x[_MA_REG_A0]), &u, sizeof(u));
+        _ma_regs.x[_MA_REG_A0] = 0;
+      }
       break;
     case 172: /* asmlinkage long sys_getpid(void); */
       _ma_regs.x[_MA_REG_A0] = getpid();
@@ -203,11 +279,16 @@ void _ma_ecall(void) {
     case 214: /* asmlinkage long sys_brk(unsigned long brk); */
       if (_ma_regs.x[_MA_REG_A0] == 0) {
         _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
-      } else if (_ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
+      } else if (_ma_vma_heap_entry->addr <= _ma_regs.x[_MA_REG_A0] &&
+          _ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
         _ma_vma_heap_cur = _ma_regs.x[_MA_REG_A0];
       } else {
         _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
       }
+      break;
+    case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = 0;
       break;
     default:
       _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
