@@ -212,17 +212,14 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
 	fmt.Fprintln(w, "_ma_vma_heap_entry_init();")
 	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
-	pc := int(elfFile.Entry)
-	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", pc)
+	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", elfFile.Entry)
 	fmt.Fprintln(w, "for (;;) {")
 	fmt.Fprintln(w, "_ma_regs_dump();")
 	fmt.Fprintln(w, "/* TODO: use an explicit jump table (for non-WASM?) */")
 	fmt.Fprintln(w, "switch(_ma_regs.pc) {")
 	textReader := textSec.Open()
-	if _, err := textReader.Seek(int64(elfFile.Entry-textSec.Addr), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to jump to the entry address 0x%08X", elfFile.Entry)
-	}
 	var inst32 uint32
+	pc := int(textSec.Addr)
 	for {
 		// TODO: support non-32 bit instructions
 		if err := binary.Read(textReader, binary.LittleEndian, &inst32); err != nil {
