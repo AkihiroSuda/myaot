@@ -1,11 +1,16 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/uio.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif /* __linux__ */
 #if defined(__APPLE__)
 #include <sys/random.h>
 #endif /* __APPLE__ */
@@ -202,7 +207,8 @@ void* _ma_translate_ptr(_ma_reg_t r) {
   return ret;
 }
 
-#define _MA_EACCESS 13
+#define _MA_EACCES 13
+#define _MA_ENOSYS 38
 
 void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
@@ -214,18 +220,50 @@ void _ma_ecall(void) {
     case 48: /* asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode); */
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = -1;
-      errno = _MA_EACCESS;
+      errno = _MA_EACCES;
       break;
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
       _ma_regs.x[_MA_REG_A0] = write((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
       break;
+    case 66: /* asmlinkage long sys_writev(unsigned long fd, const struct iovec __user *vec, unsigned long vlen); */
+      {
+        _ma_reg_t fd = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t iovcnt = _ma_regs.x[_MA_REG_A0];
+        struct _ma_iovec {
+          _ma_reg_t iov_base;
+          _ma_reg_t iov_len;
+        } _ma_iovec;
+        struct _ma_iovec *iov_g = malloc(sizeof(struct _ma_iovec)*iovcnt);
+        memcpy(iov_g, _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), sizeof(_ma_iovec)*iovcnt);
+        struct iovec *iov_h = malloc(sizeof(struct iovec)*iovcnt);
+        int i;
+        for (i = 0; i < iovcnt; i++) {
+          iov_h[i].iov_base = _ma_translate_ptr(iov_g[i].iov_base);
+          iov_h[i].iov_len = iov_g[i].iov_len;
+        }
+        _ma_regs.x[_MA_REG_A0] = writev(fd, iov_h, iovcnt);
+        free(iov_g);
+        free(iov_h);
+      }
     case 78: /* asmlinkage long sys_readlinkat(int dfd, const char __user *path, char __user *buf, int bufsiz); */
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = -1;
-      errno = _MA_EACCESS;
+      errno = _MA_EACCES;
       break;
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
+      break;
+    case 131: /* asmlinkage long sys_tgkill(pid_t tgid, pid_t pid, int sig); */
+#if defined(__linux__)
+      _ma_regs.x[_MA_REG_A0] = tgkill(_ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2]);
+#else
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = kill(_ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2]);
+#endif
+      break;
+    case 135: /* asmlinkage long sys_rt_sigprocmask(int how, sigset_t __user *set, sigset_t __user *oset, size_t sigsetsize); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = 0;
       break;
     case 160: /* asmlinkage long sys_newuname(struct new_utsname __user *name); */
       {
@@ -286,9 +324,31 @@ void _ma_ecall(void) {
         _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
       }
       break;
+    case 222: /* void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset); */
+      /* TODO */
+      if (_ma_regs.x[_MA_REG_A0] == 0) {
+        _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
+        _ma_vma_heap_cur += _ma_regs.x[_MA_REG_A1];
+      }
+			break;
     case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = 0;
+      break;
+    case 291: /* asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags, unsigned mask, struct statx __user *buffer); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_EACCES;
+      break;
+    case 422: /* asmlinkage long sys_futex(u32 __user *uaddr, int op, u32 val, struct __kernel_timespec __user *utime, u32 __user *uaddr2, u32 val3); */
+      /* TODO */
+      if ((_ma_regs.x[_MA_REG_A1] & 0x7F) == 0) {
+        /* FUTEX_WAIT */
+        _ma_regs.x[_MA_REG_A0] = -1;
+        errno = _MA_ENOSYS;
+      } else {
+        _MA_FATALF("Unknown futex op 0%08X", _ma_regs.x[_MA_REG_A1]);
+      }
       break;
     default:
       _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
