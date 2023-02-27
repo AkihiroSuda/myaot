@@ -400,35 +400,41 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 			case decoder.FenceOp: // WIP, probably wrong
 				fmt.Fprintln(w, "/* NOP */;")
 			case decoder.Atomic:
+				rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2() // often rd == rs2
+				fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
 				f5head, f5tail := decoder.Funct5Head(inst32>>29), decoder.Funct5Tail((inst32>>27)&0x3)
 				switch f3 := inst.GetFunct3(); f3 {
-				case decoder.Atomic32: // WIP, probably wrong
+				case decoder.Atomic32: // WIP, needs mutex
 					switch f5head {
 					case decoder.CommonAtomic:
 						switch f5tail {
 						case decoder.ArithAtomic: // amoadd.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] + x[rs2])
-							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
-							if rd == 0 {
-								break
-							}
-							fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
-							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val + %s\n;", rd, generateReadRegExpr(rs2))
-						case decoder.Amoswap: // amoswap.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] SWAP x[rs2])
-							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
-							fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
+							fmt.Fprintln(w, "uint32_t x, y;")
+							fmt.Fprintln(w, "memcpy(&x, p, 4);")
+							fmt.Fprintf(w, "y = x + %s\n;", generateReadRegExpr(rs2))
 							if rd != 0 {
-								fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+								fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
 							}
-							fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+							fmt.Fprintln(w, "memcpy(p, &y, 4);")
+						case decoder.Amoswap: // amoswap.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] SWAP x[rs2])
+							fmt.Fprintln(w, "uint32_t x, y;")
+							fmt.Fprintln(w, "memcpy(&x, p, 4);")
+							fmt.Fprintf(w, "y = %s\n;", generateReadRegExpr(rs2))
+							if rd != 0 {
+								fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+							}
+							fmt.Fprintln(w, "memcpy(p, &y, 4);")
 						case decoder.Lr: // lr.w rd,rs1: x[rd] = LoadReserved32(M[x[rs1]])
-							rd, rs1 := inst.GetRd(), inst.GetRs1()
 							if rd == 0 {
 								break
 							}
-							fmt.Fprintf(w, "_ma_regs.x[%d] = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", rd, generateReadRegExpr(rs1))
+							fmt.Fprintln(w, "uint32_t x, y;")
+							fmt.Fprintln(w, "memcpy(&x, p, 4);")
+							fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+							// TODO: implement reservation set
 						case decoder.Sc: // sc.w rd,rs1,rs2: x[rd] = StoreConditional32(M[x[rs1]], x[rs2])
-							rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
-							fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+							fmt.Fprintf(w, "uint32_t y = %s;", generateReadRegExpr(rs2))
+							fmt.Fprintln(w, "memcpy(p, &y, 4);")
 							if rd != 0 {
 								fmt.Fprintf(w, "_ma_regs.x[%d] = 0;\n", rd)
 							}
@@ -436,19 +442,21 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 							return fmt.Errorf("unsupported Atomic32 CommonAtomic funct5tail %+v (PC=0x%08X, instruction=0x%08X)", f5tail, pc, inst32)
 						}
 					case decoder.Amoor: // amoor.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] | x[rs2])
-						rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
-						fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
+						fmt.Fprintln(w, "uint32_t x, y;")
+						fmt.Fprintln(w, "memcpy(&x, p, 4);")
+						fmt.Fprintf(w, "y = x | %s\n;", generateReadRegExpr(rs2))
 						if rd != 0 {
-							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+							fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
 						}
-						fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = m_val | %s;\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "memcpy(p, &y, 4);")
 					case decoder.Amomaxu: // amomaxu.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] MAXU x[rs2])
-						rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
-						fmt.Fprintf(w, "_ma_reg_t m_val = *(_ma_reg_t*)_ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
+						fmt.Fprintln(w, "uint32_t x, y;")
+						fmt.Fprintln(w, "memcpy(&x, p, 4);")
+						fmt.Fprintf(w, "y = MAX(x, %s)\n;", generateReadRegExpr(rs2))
 						if rd != 0 {
-							fmt.Fprintf(w, "_ma_regs.x[%d] = m_val;\n", rd)
+							fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
 						}
-						fmt.Fprintf(w, "*(_ma_reg_t*)_ma_translate_ptr(%s) = MAX(m_val, %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "memcpy(p, &y, 4);")
 					default:
 						return fmt.Errorf("unsupported Atomic32 funct5head %+v (PC=0x%08X, instruction=0x%08X)", f5head, pc, inst32)
 					}

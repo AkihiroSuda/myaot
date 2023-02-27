@@ -344,8 +344,7 @@ void _ma_ecall(void) {
       /* TODO */
       if ((_ma_regs.x[_MA_REG_A1] & 0x7F) == 0) {
         /* FUTEX_WAIT */
-        _ma_regs.x[_MA_REG_A0] = -1;
-        errno = _MA_ENOSYS;
+        _ma_regs.x[_MA_REG_A0] = 0;
       } else {
         _MA_FATALF("Unknown futex op 0%08X", _ma_regs.x[_MA_REG_A1]);
       }
