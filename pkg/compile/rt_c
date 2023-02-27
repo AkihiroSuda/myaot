@@ -253,6 +253,13 @@ void _ma_ecall(void) {
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
       break;
+    case 94: /* asmlinkage long sys_exit_group(int error_code); */
+#if defined(__linux__)
+      syscall(SYS_exit_group, _ma_regs.x[_MA_REG_A0]);
+#else
+      exit(_ma_regs.x[_MA_REG_A0]);
+#endif
+      break;
     case 131: /* asmlinkage long sys_tgkill(pid_t tgid, pid_t pid, int sig); */
 #if defined(__linux__)
       _ma_regs.x[_MA_REG_A0] = tgkill(_ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2]);
