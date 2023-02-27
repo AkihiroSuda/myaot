@@ -253,6 +253,13 @@ void _ma_ecall(void) {
     case 93: /* asmlinkage long sys_exit(int error_code); */
       exit((int)_ma_regs.x[_MA_REG_A0]);
       break;
+    case 94: /* asmlinkage long sys_exit_group(int error_code); */
+#if defined(__linux__)
+      syscall(SYS_exit_group, _ma_regs.x[_MA_REG_A0]);
+#else
+      exit(_ma_regs.x[_MA_REG_A0]);
+#endif
+      break;
     case 131: /* asmlinkage long sys_tgkill(pid_t tgid, pid_t pid, int sig); */
 #if defined(__linux__)
       _ma_regs.x[_MA_REG_A0] = tgkill(_ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2]);
@@ -344,8 +351,7 @@ void _ma_ecall(void) {
       /* TODO */
       if ((_ma_regs.x[_MA_REG_A1] & 0x7F) == 0) {
         /* FUTEX_WAIT */
-        _ma_regs.x[_MA_REG_A0] = -1;
-        errno = _MA_ENOSYS;
+        _ma_regs.x[_MA_REG_A0] = 0;
       } else {
         _MA_FATALF("Unknown futex op 0%08X", _ma_regs.x[_MA_REG_A1]);
       }
