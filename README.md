@@ -39,16 +39,16 @@ Hello World!
 
 For WASM:
 ```console
-$ myaot compile -o a.c ./examples/hello-s/hello-riscv32
-INFO[0000] Compiling ./examples/hello-s/hello-riscv32 --> a.c
-INFO[0000] Done: a.c
+$ myaot compile -o a.out.c ./examples/hello-s/hello-riscv32
+INFO[0000] Compiling ./examples/hello-s/hello-riscv32 --> a.out.c
+INFO[0000] Done: a.out.c
 
-$ emcc -o a.wasm a.c
+$ emcc -o a.wasm a.out.c
 
 $ file a.wasm
 a.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
 
-$ emcc -o a.html -s WASM=1 a.c
+$ emcc -o a.html -sWASM -sALLOW_MEMORY_GROWTH a.out.c
 
 $ emrun a.html
 ```

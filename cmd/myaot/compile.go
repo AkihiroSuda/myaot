@@ -69,7 +69,8 @@ func compileAction(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		ccCmd := exec.Command(cc, "-O3", "-o", outFilePath, outCPath)
+		// Use -O0 by default to shorten the compilation time
+		ccCmd := exec.Command(cc, "-O0", "-o", outFilePath, outCPath)
 		ccCmd.Stdout = os.Stdout
 		ccCmd.Stderr = os.Stderr
 		logrus.Debugf("Running %v", ccCmd.Args)
