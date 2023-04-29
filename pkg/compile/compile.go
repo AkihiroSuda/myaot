@@ -228,7 +228,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 			fmt.Fprintf(w, "#define _ma_code_entry_%d (_ma_code_entry_%d)\n", codeEntryIdx, dupe)
 		} else {
 			fmt.Fprintf(w, "/* pc=0x%08X, inst = 0x%08X */\n", pc, inst32)
-			fmt.Fprintf(w, "void _ma_code_entry_%d(bool *pc_was_modified) {\n", codeEntryIdx)
+			fmt.Fprintf(w, "static void _ma_code_entry_%d(bool *pc_was_modified) {\n", codeEntryIdx)
 			inst := decoder.NewRawInstruction(inst32)
 			switch inst.MajOp {
 			case decoder.Std:
@@ -486,7 +486,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	}
 
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "_ma_code_entry_t _ma_code_entries[] = {")
+	fmt.Fprintln(w, "static _ma_code_entry_t _ma_code_entries[] = {")
 	for i := 0; i < codeEntryIdx; i++ {
 		fmt.Fprintf(w, "&_ma_code_entry_%d,\n", i)
 	}
