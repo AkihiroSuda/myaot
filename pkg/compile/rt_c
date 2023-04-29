@@ -14,6 +14,7 @@
 #if defined(__APPLE__)
 #include <sys/random.h>
 #endif /* __APPLE__ */
+#include <time.h>
 
 #if defined(_MA_DEBUG)
 static bool _ma_debug = true;
@@ -222,6 +223,9 @@ void _ma_ecall(void) {
       _ma_regs.x[_MA_REG_A0] = -1;
       errno = _MA_EACCES;
       break;
+    case 63: /* asmlinkage long sys_read(unsigned int fd, const char __user *buf, size_t count); */
+      _ma_regs.x[_MA_REG_A0] = read((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
+      break;
     case 64: /* asmlinkage long sys_write(unsigned int fd, const char __user *buf, size_t count); */
       _ma_regs.x[_MA_REG_A0] = write((int)_ma_regs.x[_MA_REG_A0], _ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), (size_t)_ma_regs.x[_MA_REG_A2]);
       break;
@@ -333,9 +337,17 @@ void _ma_ecall(void) {
       break;
     case 222: /* void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset); */
       /* TODO */
+      if (_ma_regs.x[_MA_REG_A4] != -1) {
+        _MA_FATALF("Unsupported mmap(A4=0x%08X)", _ma_regs.x[_MA_REG_A4]);
+      }
+      if (_ma_regs.x[_MA_REG_A5] != 0) {
+        _MA_FATALF("Unsupported mmap(A5=0x%08X)", _ma_regs.x[_MA_REG_A5]);
+      }
       if (_ma_regs.x[_MA_REG_A0] == 0) {
         _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
         _ma_vma_heap_cur += _ma_regs.x[_MA_REG_A1];
+      } else {
+        _MA_FATALF("Unsupported mmap(A0=0x%08X)", _ma_regs.x[_MA_REG_A0]);
       }
 			break;
     case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
@@ -346,6 +358,22 @@ void _ma_ecall(void) {
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = -1;
       errno = _MA_EACCES;
+      break;
+    case 403: /* asmlinkage long sys_clock_gettime(clockid_t which_clock, struct __kernel_timespec __user *tp); */
+      {
+        /* TODO: check which_clock */
+        struct timespec tp_host;
+        int ret = clock_gettime(CLOCK_REALTIME, &tp_host);
+        struct {
+          uint64_t tv_sec; /* time_t */
+          _ma_reg_t tv_nsec; /* long */
+        } tp = {
+          .tv_sec = (uint64_t)tp_host.tv_sec,
+          .tv_nsec = (_ma_reg_t)tp_host.tv_nsec,
+        };
+        memcpy(_ma_translate_ptr(_ma_regs.x[_MA_REG_A1]), &tp, sizeof(tp));
+        _ma_regs.x[_MA_REG_A0] = (_ma_reg_t)ret;
+      }
       break;
     case 422: /* asmlinkage long sys_futex(u32 __user *uaddr, int op, u32 val, struct __kernel_timespec __user *utime, u32 __user *uaddr2, u32 val3); */
       /* TODO */
