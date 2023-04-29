@@ -380,7 +380,7 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 					if rd == 0 {
 						break
 					}
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %d + (signed)_MA_SIGN_EXT(_ma_regs.pc,32);\n", rd, imm)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.pc + (signed)_MA_SIGN_EXT(%d,32);\n", rd, imm)
 				case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 					rd, imm := inst.GetRd(), inst.GetImmediate()
 					if rd != 0 {
@@ -500,6 +500,9 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "for (;;) {")
 	fmt.Fprintln(w, "_ma_regs_dump();")
 	// TODO: support compact instructions
+	fmt.Fprintf(w, "if ((_ma_regs.pc - 0x%08X)%%4 != 0){;\n", textSec.Addr)
+	w.Write([]byte("_MA_FATALF(\"Invalid PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
+	fmt.Fprintln(w, "} /* if*/")
 	fmt.Fprintf(w, "int idx = (_ma_regs.pc - 0x%08X)/4;\n", textSec.Addr)
 	fmt.Fprintf(w, "if (idx >= %d){\n", codeEntryIdx)
 	w.Write([]byte("_MA_FATALF(\"Invalid PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
