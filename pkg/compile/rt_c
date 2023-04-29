@@ -337,9 +337,17 @@ void _ma_ecall(void) {
       break;
     case 222: /* void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset); */
       /* TODO */
+      if (_ma_regs.x[_MA_REG_A4] != -1) {
+        _MA_FATALF("Unsupported mmap(A4=0x%08X)", _ma_regs.x[_MA_REG_A4]);
+      }
+      if (_ma_regs.x[_MA_REG_A5] != 0) {
+        _MA_FATALF("Unsupported mmap(A5=0x%08X)", _ma_regs.x[_MA_REG_A5]);
+      }
       if (_ma_regs.x[_MA_REG_A0] == 0) {
         _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
         _ma_vma_heap_cur += _ma_regs.x[_MA_REG_A1];
+      } else {
+        _MA_FATALF("Unsupported mmap(A0=0x%08X)", _ma_regs.x[_MA_REG_A0]);
       }
 			break;
     case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
