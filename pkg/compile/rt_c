@@ -48,6 +48,11 @@ static bool _ma_debug = true;
 #define _MA_SIGN_MASK(pos) (~(_MA_SIGN_BIT((pos))-1))
 #define _MA_SIGN_EXT(val, pos) ((val) & _MA_SIGN_BIT((pos)) ? ((val) | _MA_SIGN_MASK((pos))) : (val))
 
+#define __MA_JUMP_NEAR(addr, seg_head, addr_labels) goto *(addr_labels)[((addr) - (seg_head))/4]
+#define __MA_JUMP_FAR(addr) return (addr)
+#define __MA_JUMP(addr, seg_head, seg_size, addr_labels) \
+  if ((unsigned)((addr) - (seg_head)) < (seg_size)) { __MA_JUMP_NEAR((addr), (seg_head), (addr_labels)); } else { __MA_JUMP_FAR((addr)); }
+
 #if !defined(_MA_REG_TYPE)
 #define _MA_REG_TYPE uint32_t
 #endif /* _MA_REG_TYPE */
