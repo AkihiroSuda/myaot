@@ -10,6 +10,7 @@ import (
 	"io"
 
 	"github.com/AkihiroSuda/myaot/pkg/iomisc"
+	"github.com/AkihiroSuda/myaot/pkg/signext"
 	"github.com/sirupsen/logrus"
 	"gitlab.com/knipegp/vemu/decoder"
 )
@@ -361,7 +362,7 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			shamt := imm & 0b11111
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Addi: // addi rd,rs1,imm: x[rd] = x[rs1] + sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Slli: // slli rd,rs1,shamt: x[rd] = x[rs1] << shamt
 				fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %d;\n", rd, generateReadRegExpr(rs1), shamt)
 			case decoder.Sr:
@@ -374,15 +375,15 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 					return fmt.Errorf("unsupported IntRegImm funct7 %+v", f7)
 				}
 			case decoder.Slti: // slti rd,rs1,imm: x[rd] = x[rs1] <s sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Sltiu: // sltiu rd,rs1,imm: x[rd] = x[rs1] <u sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned) %s < (unsigned)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned) %s < (unsigned)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Andi: // andi rd,rs1,imm: x[rd] = x[rs1] & sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Xori: // xori rd,rs1,imm: x[rd] = x[rs1] ^ sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Ori: // ori rd,rs1,imm: x[rd] = x[rs1] | sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)_MA_SIGN_EXT(%d,12);\n", rd, generateReadRegExpr(rs1), imm)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			default:
 				return fmt.Errorf("unsupported IntRegImm funct3 %+v", f3)
 			}
@@ -391,7 +392,7 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
 				fmt.Fprintln(w, "u8 = *(uint8_t*)p;")
@@ -413,7 +414,7 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			}
 		case decoder.Store:
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
-			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Sb: // sb rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][7:0]]
 				fmt.Fprintf(w, "u8 = %s & 0xFF;\n", generateReadRegExpr(rs2))
@@ -431,17 +432,17 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Beq: // beq rs1,rs2,offset: if (x[rs1] == x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s == %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if (%s == %s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s != %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if (%s != %s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] <u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s < %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if (%s < %s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s >= %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
+				fmt.Fprintf(w, "if (%s >= %s) { pc_modified = 0x%08X; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
 			default:
 				return fmt.Errorf("unsupported Branch funct3 %+v", f3)
 			}
@@ -451,23 +452,23 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT(%d,32);\n", rd, imm)
+			fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%d;\n", rd, signext.SignExt(int(imm), 32))
 		case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)
 			rd, imm := inst.GetRd(), inst.GetImmediate()
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X + (signed)_MA_SIGN_EXT(%d,32);\n", rd, instAddr, imm)
+			fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+uint64(signext.SignExt(int(imm), 32)))
 		case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 			rd, imm := inst.GetRd(), inst.GetImmediate()
 			if rd != 0 {
 				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
-			fmt.Fprintf(w, "pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,21);\n", instAddr, imm)
+			fmt.Fprintf(w, "pc_modified = 0x%08X;\n", instAddr+uint64(signext.SignExt(int(imm), 21)))
 			pcStatus = PCStatusSurelyModified
 		case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
-			fmt.Fprintf(w, "pc_modified = (%s + (signed)_MA_SIGN_EXT(%d,12))&~1;\n", generateReadRegExpr(rs1), imm)
+			fmt.Fprintf(w, "pc_modified = (%s + (signed)%d)&~1;\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			if rd != 0 {
 				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
