@@ -259,8 +259,8 @@ func generateReadRegExpr(reg decoder.RegisterIndex) string {
 }
 
 func generateCodeFunc(w io.Writer, r io.Reader, segHead, segSize uint64) error {
-	fmt.Fprintf(w, "_ma_reg_t _ma_code_func_0x%08X(_ma_reg_t pc_initial){\n", segHead)
-	fmt.Fprintln(w, "const void *addr_labels[] = {")
+	fmt.Fprintf(w, "_ma_reg_t static _ma_code_func_0x%08X(_ma_reg_t pc_initial){\n", segHead)
+	fmt.Fprintln(w, "const static void *addr_labels[] = {")
 	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
 		fmt.Fprintf(w, "&&L_0x%08X,\n", instAddr)
 	}

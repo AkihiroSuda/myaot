@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -8,12 +9,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif /* __linux__ */
 #if defined(__APPLE__)
 #include <sys/random.h>
 #endif /* __APPLE__ */
+#include <termios.h>
 #include <time.h>
 
 #if defined(_MA_DEBUG)
@@ -215,6 +218,76 @@ void* _ma_translate_ptr(_ma_reg_t r) {
 #define _MA_EACCES 13
 #define _MA_ENOSYS 38
 
+#define _MA_TCGETS 0x5401
+typedef _ma_reg_t _ma_tcflag_t;
+typedef uint8_t _ma_cc_t;
+#define _MA_NCCS 19
+struct _ma_termios {
+  _ma_tcflag_t c_iflag;
+  _ma_tcflag_t c_oflag;
+  _ma_tcflag_t c_cflag;
+  _ma_tcflag_t c_lflag;
+  _ma_cc_t c_line;
+  _ma_cc_t c_cc[_MA_NCCS];
+};
+
+#define _MA_AT_EMPTY_PATH 0x1000
+
+struct _ma_statx_timestamp {
+  int64_t tv_sec;
+  uint32_t tv_nsec;
+};
+struct _ma_statx {
+  uint32_t stx_mask;
+  uint32_t stx_blksize;
+  uint64_t stx_attributes;
+  uint32_t stx_nlink;
+  uint32_t stx_uid;
+  uint32_t stx_gid;
+  uint16_t stx_mode;
+  uint64_t stx_ino;
+  uint64_t stx_size;
+  uint64_t stx_blocks;
+  uint64_t stx_attributes_mask;
+  struct _ma_statx_timestamp stx_atime;
+  struct _ma_statx_timestamp stx_btime;
+  struct _ma_statx_timestamp stx_ctime;
+  struct _ma_statx_timestamp stx_mtime;
+  uint32_t stx_rdev_major;
+  uint32_t stx_rdev_minor;
+  uint32_t stx_dev_major;
+  uint32_t stx_dev_minor;
+  uint64_t stx_mnt_id;
+  uint32_t stx_dio_mem_align;
+  uint32_t stx_dio_offset_align;
+  uint64_t __spare3[12];
+};
+#define _MA_STATX_TYPE 0x00000001U
+#define _MA_STATX_MODE 0x00000002U
+#define _MA_STATX_NLINK 0x00000004U
+#define _MA_STATX_UID 0x00000008U
+#define _MA_STATX_GID 0x00000010U
+#define _MA_STATX_ATIME 0x00000020U
+#define _MA_STATX_MTIME 0x00000040U
+#define _MA_STATX_CTIME 0x00000080U
+#define _MA_STATX_INO 0x00000100U
+#define _MA_STATX_SIZE 0x00000200U
+#define _MA_STATX_BLOCKS 0x00000400U
+#define _MA_STATX_BASIC_STATS 0x000007ffU
+#define _MA_STATX_BTIME 0x00000800U
+#define _MA_STATX_MNT_ID 0x00001000U
+#define _MA_STATX_DIOALIGN 0x00002000U
+#define _MA_STATX__RESERVED 0x80000000U
+#define _MA_STATX_ATTR_COMPRESSED 0x00000004
+#define _MA_STATX_ATTR_IMMUTABLE 0x00000010
+#define _MA_STATX_ATTR_APPEND 0x00000020
+#define _MA_STATX_ATTR_NODUMP 0x00000040
+#define _MA_STATX_ATTR_ENCRYPTED 0x00000800
+#define _MA_STATX_ATTR_AUTOMOUNT 0x00001000
+#define _MA_STATX_ATTR_MOUNT_ROOT 0x00002000
+#define _MA_STATX_ATTR_VERITY 0x00100000
+#define _MA_STATX_ATTR_DAX  0x00200000
+
 void _ma_ecall(void) {
   _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
       _ma_regs.x[_MA_REG_A7],
@@ -222,6 +295,40 @@ void _ma_ecall(void) {
   errno = 0;
   /* Syscall table: https://jborza.com/post/2021-05-11-riscv-linux-syscalls/ */
   switch (_ma_regs.x[_MA_REG_A7]){
+    case 29: /* asmlinkage long sys_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg); */
+      {
+        /* TODO */
+        _ma_reg_t fd = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t cmd = _ma_regs.x[_MA_REG_A1];
+        _ma_reg_t arg = _ma_regs.x[_MA_REG_A2];
+        switch (cmd) {
+          case _MA_TCGETS:
+            {
+              struct termios t_host;
+              int rc = tcgetattr(fd, &t_host);
+              if (rc == 0) {
+                struct _ma_termios t;
+                memset(&t, 0, sizeof(t));
+                t.c_iflag = t_host.c_iflag;
+                t.c_oflag = t_host.c_oflag;
+                t.c_cflag = t_host.c_cflag;
+                t.c_lflag = t_host.c_lflag;
+                memcpy(t.c_cc, t_host.c_cc, MIN(NCCS, _MA_NCCS));
+                memcpy(_ma_translate_ptr(arg), &t, sizeof(t));
+                _ma_regs.x[_MA_REG_A0] = 0;
+              } else {
+                _ma_regs.x[_MA_REG_A0] = -1;
+              }
+            }
+            break;
+          default:
+            _ma_regs.x[_MA_REG_A0] = -1;
+            errno = _MA_EACCES;
+            _MA_FATALF("Unsupported ioctl(%d, 0x%08X, 0x%08X)", fd, cmd, arg);
+            break;
+        }
+      }
+      break;
     case 48: /* asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode); */
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = -1;
@@ -236,7 +343,7 @@ void _ma_ecall(void) {
     case 66: /* asmlinkage long sys_writev(unsigned long fd, const struct iovec __user *vec, unsigned long vlen); */
       {
         _ma_reg_t fd = _ma_regs.x[_MA_REG_A0];
-        _ma_reg_t iovcnt = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t iovcnt = _ma_regs.x[_MA_REG_A2];
         struct _ma_iovec {
           _ma_reg_t iov_base;
           _ma_reg_t iov_len;
@@ -359,9 +466,33 @@ void _ma_ecall(void) {
       _ma_regs.x[_MA_REG_A0] = 0;
       break;
     case 291: /* asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags, unsigned mask, struct statx __user *buffer); */
-      /* TODO */
-      _ma_regs.x[_MA_REG_A0] = -1;
-      errno = _MA_EACCES;
+      {
+        _ma_reg_t dfd = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t flags = _ma_regs.x[_MA_REG_A2];
+        if ((flags & _MA_AT_EMPTY_PATH) == 0) {
+          _MA_FATALF("Unsupported statx(flags=0x%08X)", flags);
+        }
+        struct stat st;
+        errno = fstat(dfd, &st);
+        if (errno == 0) {
+          struct _ma_statx stx;
+          memset(&stx, 0, sizeof(stx));
+          stx.stx_mask = _MA_STATX_BASIC_STATS;
+          stx.stx_blksize = st.st_blksize;
+          stx.stx_attributes = 0;
+          stx.stx_nlink = st.st_nlink;
+          stx.stx_uid = st.st_uid;
+          stx.stx_gid = st.st_gid;
+          stx.stx_mode = st.st_mode;
+          stx.stx_ino = st.st_ino;
+          stx.stx_size = st.st_size;
+          stx.stx_blocks = st.st_blocks;
+          memcpy(_ma_translate_ptr(_ma_regs.x[_MA_REG_A4]), &stx, sizeof(stx));
+          _ma_regs.x[_MA_REG_A0] = 0;
+        } else {
+          _ma_regs.x[_MA_REG_A0] = -1;
+        }
+      }
       break;
     case 403: /* asmlinkage long sys_clock_gettime(clockid_t which_clock, struct __kernel_timespec __user *tp); */
       {
