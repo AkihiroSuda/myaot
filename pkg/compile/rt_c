@@ -236,7 +236,7 @@ void _ma_ecall(void) {
     case 66: /* asmlinkage long sys_writev(unsigned long fd, const struct iovec __user *vec, unsigned long vlen); */
       {
         _ma_reg_t fd = _ma_regs.x[_MA_REG_A0];
-        _ma_reg_t iovcnt = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t iovcnt = _ma_regs.x[_MA_REG_A2];
         struct _ma_iovec {
           _ma_reg_t iov_base;
           _ma_reg_t iov_len;
