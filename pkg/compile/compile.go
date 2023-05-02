@@ -208,68 +208,48 @@ func generatePH(w io.Writer, r io.ReaderAt, elfFile *elf.File) error {
 	return nil
 }
 
+// TODO: support non-32 bit instructions
 func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
-	fmt.Fprintln(w, "typedef void (*_ma_code_entry_t)(bool *pc_was_modified);")
+	fmt.Fprintln(w, "typedef _ma_reg_t (*_ma_code_func_t)(_ma_reg_t pc);")
 	fmt.Fprintln(w, "")
+
+	// The instructions are split to small "segments" to shorten the compilation time
+	const segSize uint64 = 1024
+	fmt.Fprintln(w, "/* Macros */")
+	fmt.Fprintln(w, "#define _MA_GOTO_ADDR_NEAR(addr, seg_head) goto *addr_labels[((addr) - (seg_head))/4]")
+	fmt.Fprintln(w, "#define _MA_GOTO_ADDR_FAR(addr) return (addr)")
+	fmt.Fprintf(w, "#define _MA_GOTO_ADDR(addr, seg_head) if (((addr) - (seg_head)) < %d) { _MA_GOTO_ADDR_NEAR((addr), (seg_head)); } else { _MA_GOTO_ADDR_FAR((addr)); }\n", segSize)
+	fmt.Fprintln(w, "#define _MA_GOTO_MODIFIED_PC(pc_modified, seg_head) {_ma_reg_t pc_modified_bak = (pc_modified); (pc_modified) = 0; _MA_GOTO_ADDR(pc_modified_bak, (seg_head));}")
+	fmt.Fprintln(w, "")
+
 	textReader := textSec.Open()
-	var (
-		inst32       uint32
-		codeEntryIdx int
-	)
-	codeEntryCache := make(map[uint32]int) // key: inst32, val: codeEntryIdx; TODO: use lru?
-	instAddr := int(textSec.Addr)
-	for {
-		// TODO: support non-32 bit instructions
-		if err := binary.Read(textReader, binary.LittleEndian, &inst32); err != nil {
-			return err
+	for instAddr := textSec.Addr; instAddr < textSec.Addr+textSec.Size; instAddr += segSize {
+		currentSegSize := segSize
+		if instAddr+currentSegSize > textSec.Addr+textSec.Size {
+			currentSegSize = textSec.Addr + textSec.Size - instAddr
 		}
-		if dupe, ok := codeEntryCache[inst32]; ok {
-			fmt.Fprintf(w, "/* addr=0x%08X, inst = 0x%08X, duplicate of entry %d */\n", instAddr, inst32, dupe)
-			fmt.Fprintf(w, "#define _ma_code_entry_%d (_ma_code_entry_%d)\n", codeEntryIdx, dupe)
-		} else {
-			fmt.Fprintf(w, "/* addr=0x%08X, inst = 0x%08X */\n", instAddr, inst32)
-			fmt.Fprintf(w, "static void _ma_code_entry_%d(bool *pc_was_modified) {\n", codeEntryIdx)
-			if err := generateCodeEntry(w, inst32); err != nil {
-				return fmt.Errorf("%w (PC=0x%08X, instruction=0x%08X)", err, instAddr, inst32)
-			}
-			fmt.Fprintln(w, "}")
-			codeEntryCache[inst32] = codeEntryIdx
-		}
-		fmt.Fprintln(w, "")
-		codeEntryIdx++
-		instAddr += 4
-		if instAddr >= int(textSec.Addr+textSec.Size) {
-			break
+		if err := generateCodeFunc(w, textReader, instAddr, currentSegSize); err != nil {
+			return fmt.Errorf("failed to generate the function (segmentation addr=0x%08X, size=%d): %w", instAddr, currentSegSize, err)
 		}
 	}
 
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "static _ma_code_entry_t _ma_code_entries[] = {")
-	for i := 0; i < codeEntryIdx; i++ {
-		fmt.Fprintf(w, "&_ma_code_entry_%d,\n", i)
+	fmt.Fprintln(w, "_ma_code_func_t _ma_code_funcs[] = {")
+	for instAddr := textSec.Addr; instAddr < textSec.Addr+textSec.Size; instAddr += segSize {
+		fmt.Fprintf(w, "&_ma_code_func_0x%08X,\n", instAddr)
 	}
-	fmt.Fprintln(w, "}; /* _ma_code_entries */")
+	fmt.Fprintln(w, "}; /* _ma_code_funcs */")
 	fmt.Fprintln(w, "")
 
 	fmt.Fprintln(w, "int main(int argc, char *argv[]) {")
+	fmt.Fprintln(w, "/* Init */")
 	fmt.Fprintln(w, "_ma_vma_heap_entry_init();")
 	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
-	fmt.Fprintf(w, "_ma_regs.pc = 0x%08X;\n", elfFile.Entry)
-	fmt.Fprintln(w, "for (;;) {")
-	fmt.Fprintln(w, "_ma_regs_dump();")
-	// TODO: support compact instructions
-	fmt.Fprintf(w, "if ((_ma_regs.pc - 0x%08X)%%4 != 0){;\n", textSec.Addr)
-	w.Write([]byte("_MA_FATALF(\"Invalid PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
-	fmt.Fprintln(w, "} /* if*/")
-	fmt.Fprintf(w, "int idx = (_ma_regs.pc - 0x%08X)/4;\n", textSec.Addr)
-	fmt.Fprintf(w, "if (idx >= %d){\n", codeEntryIdx)
-	w.Write([]byte("_MA_FATALF(\"Invalid PC 0x%08X\", _ma_regs.pc);\n")) // To silence `go vet`
-	fmt.Fprintln(w, "} /* if*/")
-	fmt.Fprintln(w, "_ma_code_entry_t f = _ma_code_entries[idx];")
-	fmt.Fprintln(w, "bool pc_was_modified = false;")
-	fmt.Fprintln(w, "f(&pc_was_modified);")
-	fmt.Fprintln(w, "if (!pc_was_modified){ _ma_regs.pc += 4;}")
-	fmt.Fprintln(w, "} /* for */")
+	fmt.Fprintf(w, "_ma_reg_t pc = 0x%08X;\n", elfFile.Entry)
+	fmt.Fprintln(w, "while(1) {")
+	fmt.Fprintf(w, "int f_idx = (pc - 0x%08X) / %d;\n", textSec.Addr, segSize)
+	fmt.Fprintln(w, "_ma_code_func_t f = _ma_code_funcs[f_idx];")
+	fmt.Fprintln(w, "pc = f(pc);")
+	fmt.Fprintln(w, "} /* while(1) */")
 	fmt.Fprintln(w, "} /* main */")
 	fmt.Fprintln(w, "")
 
@@ -284,8 +264,53 @@ func generateReadRegExpr(reg decoder.RegisterIndex) string {
 	return fmt.Sprintf("_ma_regs.x[%d]", reg)
 }
 
-func generateCodeEntry(w io.Writer, inst32 uint32) error {
+func generateCodeFunc(w io.Writer, r io.Reader, segHead, segSize uint64) error {
+	fmt.Fprintf(w, "_ma_reg_t _ma_code_func_0x%08X(_ma_reg_t pc_initial){\n", segHead)
+	fmt.Fprintln(w, "const void *addr_labels[] = {")
+	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
+		fmt.Fprintf(w, "&&L_0x%08X,\n", instAddr)
+	}
+	fmt.Fprintln(w, "}; /* addr_labels */")
+	fmt.Fprintln(w, "/* Temp variables */")
+	fmt.Fprintln(w, "uint8_t u8;")
+	fmt.Fprintln(w, "uint16_t u16;")
+	fmt.Fprintln(w, "uint32_t u32, u32_x, u32_y;")
+	fmt.Fprintln(w, "void *p;")
+	fmt.Fprintln(w, "/* Program counter (only set if it was modified)*/")
+	fmt.Fprintln(w, "_ma_reg_t pc_modified = 0;")
+	fmt.Fprintf(w, "_MA_GOTO_ADDR_NEAR(pc_initial, 0x%08X)\n;", segHead)
+
+	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
+		var inst32 uint32
+		if err := binary.Read(r, binary.LittleEndian, &inst32); err != nil {
+			return err
+		}
+		if err := generateCodeEntry(w, segHead, instAddr, inst32); err != nil {
+			return fmt.Errorf("%w (addr=0x%08X, instruction=0x%08X)", err, instAddr, inst32)
+		}
+	}
+
+	fmt.Fprintf(w, "return 0x%08X\n;", segHead+segSize)
+	fmt.Fprintf(w, "} /* _ma_code_func_0x%08X */\n", segHead)
+	fmt.Fprintln(w, "")
+	return nil
+}
+
+type PCStatus int
+
+const (
+	PCStatusSurelyUnmodified PCStatus = iota
+	PCStatusSurelyModified
+	PCStatusMaybeModified
+)
+
+func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) error {
+	fmt.Fprintf(w, "L_0x%08X:\n", instAddr)
+	if logrus.GetLevel() >= logrus.DebugLevel {
+		fmt.Fprintf(w, "_ma_regs_dump(0x%08X);\n", instAddr)
+	}
 	inst := decoder.NewRawInstruction(inst32)
+	pcStatus := PCStatusSurelyUnmodified
 	switch inst.MajOp {
 	case decoder.Std:
 		switch minorOp := inst.GetMinorOpcode(); minorOp {
@@ -366,44 +391,39 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
-				fmt.Fprintln(w, "uint8_t x;")
-				fmt.Fprintln(w, "memcpy(&x, p, 1);")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 8);\n", rd)
+				fmt.Fprintln(w, "u8 = *(uint8_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u8, 8);\n", rd)
 			case decoder.Lbu: // lbu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][7:0]
-				fmt.Fprintln(w, "uint8_t x;")
-				fmt.Fprintln(w, "memcpy(&x, p, 1);")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+				fmt.Fprintln(w, "u8 = *(uint8_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = u8;\n", rd)
 			case decoder.Lh: // lh rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][15:0])
-				fmt.Fprintln(w, "uint16_t x;")
-				fmt.Fprintln(w, "memcpy(&x, p, 2);")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 16);\n", rd)
+				fmt.Fprintln(w, "u16 = *(uint16_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u16, 16);\n", rd)
 			case decoder.Lhu: // lhu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][15:0]
-				fmt.Fprintln(w, "uint16_t x;")
-				fmt.Fprintln(w, "memcpy(&x, p, 2);")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+				fmt.Fprintln(w, "u16 = *(uint16_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = u16;\n", rd)
 			case decoder.Lw: // lw rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][31:0])
-				fmt.Fprintln(w, "uint32_t x;")
-				fmt.Fprintln(w, "memcpy(&x, p, 4);")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)x, 32);\n", rd)
+				fmt.Fprintln(w, "u32 = *(uint32_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u32, 32);\n", rd)
 			default:
 				return fmt.Errorf("unsupported Load funct3 %+v", f3)
 			}
 		case decoder.Store:
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
-			fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)_MA_SIGN_EXT(%d,12));\n", generateReadRegExpr(rs1), imm)
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Sb: // sb rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][7:0]]
-				fmt.Fprintf(w, "uint8_t x = %s & 0xFF;\n", generateReadRegExpr(rs2))
-				fmt.Fprintln(w, "memcpy(p, &x, 1);")
+				fmt.Fprintf(w, "u8 = %s & 0xFF;\n", generateReadRegExpr(rs2))
+				fmt.Fprintln(w, "*(uint8_t*)p = u8;")
 			case decoder.Sh: // sh rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][15:0]]
-				fmt.Fprintf(w, "uint16_t x = %s & 0xFFFF;\n", generateReadRegExpr(rs2))
-				fmt.Fprintln(w, "memcpy(p, &x, 2);")
+				fmt.Fprintf(w, "u16 = %s & 0xFFFF;\n", generateReadRegExpr(rs2))
+				fmt.Fprintln(w, "*(uint16_t*)p = u16;")
 			case decoder.Sw: // sw rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][31:0]]
-				fmt.Fprintf(w, "uint32_t x = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs2))
-				fmt.Fprintln(w, "memcpy(p, &x, 4);")
+				fmt.Fprintf(w, "u32 = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs2))
+				fmt.Fprintln(w, "*(uint32_t*)p = u32;")
 			default:
 				return fmt.Errorf("unsupported Store funct3 %+v", f3)
 			}
@@ -411,20 +431,21 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Beq: // beq rs1,rs2,offset: if (x[rs1] == x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s == %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return ; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if (%s == %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s != %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if (%s != %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] <u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s < %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if (%s < %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s >= %s) { _ma_regs.pc += (signed)_MA_SIGN_EXT(%d,13); *pc_was_modified = true; return; }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), imm)
+				fmt.Fprintf(w, "if (%s >= %s) { pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,13); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr, imm)
 			default:
 				return fmt.Errorf("unsupported Branch funct3 %+v", f3)
 			}
+			pcStatus = PCStatusMaybeModified
 		case decoder.Lui: // lui rd,imm: x[rd] = sext(immediate[31:12] << 12)
 			rd, imm := inst.GetRd(), inst.GetImmediate()
 			if rd == 0 {
@@ -436,33 +457,28 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.pc + (signed)_MA_SIGN_EXT(%d,32);\n", rd, imm)
+			fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X + (signed)_MA_SIGN_EXT(%d,32);\n", rd, instAddr, imm)
 		case decoder.Jal: // jal rd,offset: x[rd] = pc+4; pc += sext(offset)
 			rd, imm := inst.GetRd(), inst.GetImmediate()
 			if rd != 0 {
-				fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.pc + 4;\n", rd)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
-			fmt.Fprintf(w, "_ma_regs.pc += (signed)_MA_SIGN_EXT(%d,21);\n", imm)
-			fmt.Fprintln(w, "*pc_was_modified = true;")
-			fmt.Fprintln(w, "return;")
+			fmt.Fprintf(w, "pc_modified = 0x%08X + (signed)_MA_SIGN_EXT(%d,21);\n", instAddr, imm)
+			pcStatus = PCStatusSurelyModified
 		case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+			fmt.Fprintf(w, "pc_modified = (%s + (signed)_MA_SIGN_EXT(%d,12))&~1;\n", generateReadRegExpr(rs1), imm)
 			if rd != 0 {
-				fmt.Fprintln(w, "_ma_reg_t t_val = _ma_regs.pc +4;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
-			fmt.Fprintf(w, "_ma_regs.pc = (%s + (signed)_MA_SIGN_EXT(%d,12))&~1;\n", generateReadRegExpr(rs1), imm)
-			if rd != 0 {
-				fmt.Fprintf(w, "_ma_regs.x[%d] = t_val;\n", rd)
-			}
-			fmt.Fprintln(w, "*pc_was_modified = true;")
-			fmt.Fprintln(w, "return;")
+			pcStatus = PCStatusSurelyModified
 		case decoder.Sys:
 			fmt.Fprintln(w, "_ma_ecall();")
 		case decoder.FenceOp: // WIP, probably wrong
 			fmt.Fprintln(w, "/* NOP */;")
 		case decoder.Atomic:
 			rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2() // often rd == rs2
-			fmt.Fprintf(w, "uint8_t *p = _ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
 			f5head, f5tail := decoder.Funct5Head(inst32>>29), decoder.Funct5Tail((inst32>>27)&0x3)
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Atomic32: // WIP, needs mutex
@@ -470,32 +486,29 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 				case decoder.CommonAtomic:
 					switch f5tail {
 					case decoder.ArithAtomic: // amoadd.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] + x[rs2])
-						fmt.Fprintln(w, "uint32_t x, y;")
-						fmt.Fprintln(w, "memcpy(&x, p, 4);")
-						fmt.Fprintf(w, "y = x + %s\n;", generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "u32_x = *(uint32_t*)p;")
+						fmt.Fprintf(w, "u32_y = u32_x + %s\n;", generateReadRegExpr(rs2))
 						if rd != 0 {
-							fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+							fmt.Fprintf(w, "_ma_regs.x[%d] = u32_x;\n", rd)
 						}
-						fmt.Fprintln(w, "memcpy(p, &y, 4);")
+						fmt.Fprintln(w, "*(uint32_t*)p = u32_y;")
 					case decoder.Amoswap: // amoswap.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] SWAP x[rs2])
-						fmt.Fprintln(w, "uint32_t x, y;")
-						fmt.Fprintln(w, "memcpy(&x, p, 4);")
-						fmt.Fprintf(w, "y = %s\n;", generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "u32_x = *(uint32_t*)p;")
+						fmt.Fprintf(w, "u32_y = %s\n;", generateReadRegExpr(rs2))
 						if rd != 0 {
-							fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+							fmt.Fprintf(w, "_ma_regs.x[%d] = u32_x;\n", rd)
 						}
-						fmt.Fprintln(w, "memcpy(p, &y, 4);")
+						fmt.Fprintln(w, "*(uint32_t*)p = u32_y;")
 					case decoder.Lr: // lr.w rd,rs1: x[rd] = LoadReserved32(M[x[rs1]])
 						if rd == 0 {
 							break
 						}
-						fmt.Fprintln(w, "uint32_t x, y;")
-						fmt.Fprintln(w, "memcpy(&x, p, 4);")
-						fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+						fmt.Fprintln(w, "u32_x = *(uint32_t*)p;")
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u32_x;\n", rd)
 						// TODO: implement reservation set
 					case decoder.Sc: // sc.w rd,rs1,rs2: x[rd] = StoreConditional32(M[x[rs1]], x[rs2])
-						fmt.Fprintf(w, "uint32_t y = %s;", generateReadRegExpr(rs2))
-						fmt.Fprintln(w, "memcpy(p, &y, 4);")
+						fmt.Fprintf(w, "u32_y = %s;", generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "*(uint32_t*)p = u32_y;")
 						if rd != 0 {
 							fmt.Fprintf(w, "_ma_regs.x[%d] = 0;\n", rd)
 						}
@@ -503,21 +516,19 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 						return fmt.Errorf("unsupported Atomic32 CommonAtomic funct5tail %+v", f5tail)
 					}
 				case decoder.Amoor: // amoor.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] | x[rs2])
-					fmt.Fprintln(w, "uint32_t x, y;")
-					fmt.Fprintln(w, "memcpy(&x, p, 4);")
-					fmt.Fprintf(w, "y = x | %s\n;", generateReadRegExpr(rs2))
+					fmt.Fprintln(w, "u32_x = *(uint32_t*)p;")
+					fmt.Fprintf(w, "u32_y = u32_x | %s\n;", generateReadRegExpr(rs2))
 					if rd != 0 {
-						fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u32_x;\n", rd)
 					}
-					fmt.Fprintln(w, "memcpy(p, &y, 4);")
+					fmt.Fprintln(w, "*(uint32_t*)p = u32_y;")
 				case decoder.Amomaxu: // amomaxu.w rd,rs2,(rs1): x[rd] = AMO32(M[x[rs1]] MAXU x[rs2])
-					fmt.Fprintln(w, "uint32_t x, y;")
-					fmt.Fprintln(w, "memcpy(&x, p, 4);")
-					fmt.Fprintf(w, "y = MAX(x, %s)\n;", generateReadRegExpr(rs2))
+					fmt.Fprintln(w, "u32_x = *(uint32_t*)p;")
+					fmt.Fprintf(w, "u32_y = MAX(u32_x, %s)\n;", generateReadRegExpr(rs2))
 					if rd != 0 {
-						fmt.Fprintf(w, "_ma_regs.x[%d] = x;\n", rd)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u32_x;\n", rd)
 					}
-					fmt.Fprintln(w, "memcpy(p, &y, 4);")
+					fmt.Fprintln(w, "*(uint32_t*)p = u32_y;")
 				default:
 					return fmt.Errorf("unsupported Atomic32 funct5head %+v", f5head)
 				}
@@ -529,6 +540,14 @@ func generateCodeEntry(w io.Writer, inst32 uint32) error {
 		}
 	default:
 		return fmt.Errorf("unsupported major opcode 0x%02X", inst.MajOp)
+	}
+	switch pcStatus {
+	case PCStatusSurelyUnmodified:
+		/* NOP */
+	case PCStatusSurelyModified:
+		fmt.Fprintf(w, "_MA_GOTO_MODIFIED_PC(pc_modified, 0x%08X);\n", segHead)
+	case PCStatusMaybeModified:
+		fmt.Fprintf(w, "if (pc_modified != 0) { _MA_GOTO_MODIFIED_PC(pc_modified, 0x%08X); }\n", segHead)
 	}
 	return nil
 }

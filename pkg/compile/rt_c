@@ -88,15 +88,14 @@ typedef _MA_REG_TYPE _ma_reg_t;
 #define _MA_REG_T6 31
 
 struct _ma_regs {
-  _ma_reg_t pc;
   _ma_reg_t x[32];
 } _ma_regs;
 
 struct _ma_regs _ma_regs;
 
 
-void _ma_regs_dump(void) {
-  _MA_DEBUGF("=== PC=%08X ===", _ma_regs.pc);
+void _ma_regs_dump(_ma_reg_t pc) {
+  _MA_DEBUGF("=== PC=%08X ===", pc);
   _MA_DEBUGF("X0=%08X X1(RA)=%08X X2(SP)=%08X X3(GP)=%08X X4(TP)=%08X X5(T0)=%08X X6=%08X X7=%08X",
       _ma_regs.x[0], _ma_regs.x[1], _ma_regs.x[2], _ma_regs.x[3], _ma_regs.x[4], _ma_regs.x[5], _ma_regs.x[6], _ma_regs.x[7]);
   _MA_DEBUGF("X8(S0/FP)=%08X X9(S1)=%08X X10(A0)=%08X X11=%08X X12=%08X, X13=%08X, X14=%08X, X15=%08X",
