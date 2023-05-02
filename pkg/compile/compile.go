@@ -325,9 +325,9 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			case decoder.RegShift:
 				switch f7 := inst.GetFunct7(); f7 {
 				case decoder.Srl: // srl rd,rs1,rs2: x[rd] = x[rs1] >>u x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> %s & 0x1f);\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 				case decoder.Sra: // sra rd,rs1,rs2: x[rd] = x[rs1] >>s x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> %s & 0x1f);\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 				default:
 					return fmt.Errorf("unsupported RegReg funct7 %+v", f7)
 				}
