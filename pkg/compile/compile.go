@@ -258,6 +258,13 @@ func generateReadRegExpr(reg decoder.RegisterIndex) string {
 	return fmt.Sprintf("_ma_regs.x[%d]", reg)
 }
 
+func generateStaticJumpStmt(addr, segHead, segSize uint64) string {
+	if (addr - segHead) < segSize {
+		return fmt.Sprintf("goto L_0x%08X;", addr)
+	}
+	return fmt.Sprintf("return 0x%08X;", addr)
+}
+
 func generateCodeFunc(w io.Writer, r io.Reader, segHead, segSize uint64) error {
 	fmt.Fprintf(w, "_ma_reg_t static _ma_code_func_0x%08X(_ma_reg_t pc_initial){\n", segHead)
 	fmt.Fprintln(w, "const static void *addr_labels[] = {")
@@ -266,31 +273,33 @@ func generateCodeFunc(w io.Writer, r io.Reader, segHead, segSize uint64) error {
 	}
 	fmt.Fprintln(w, "}; /* addr_labels */")
 	fmt.Fprintf(w, "#define _MA_JUMP(addr) __MA_JUMP((addr), 0x%08X, %d, addr_labels)\n", segHead, segSize)
+	fmt.Fprintf(w, "#define _MA_JUMP_NEAR(addr) __MA_JUMP_NEAR((addr), 0x%08X, addr_labels)\n", segHead)
 	fmt.Fprintln(w, "/* Temp variables */")
 	fmt.Fprintln(w, "uint8_t u8;")
 	fmt.Fprintln(w, "uint16_t u16;")
 	fmt.Fprintln(w, "uint32_t u32, u32_x, u32_y;")
 	fmt.Fprintln(w, "void *p;")
-	fmt.Fprintln(w, "_MA_JUMP(pc_initial)\n;")
+	fmt.Fprintln(w, "_MA_JUMP_NEAR(pc_initial);")
 
 	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
 		var inst32 uint32
 		if err := binary.Read(r, binary.LittleEndian, &inst32); err != nil {
 			return err
 		}
-		if err := generateCodeEntry(w, segHead, instAddr, inst32); err != nil {
+		if err := generateCodeEntry(w, segHead, segSize, instAddr, inst32); err != nil {
 			return fmt.Errorf("%w (addr=0x%08X, instruction=0x%08X)", err, instAddr, inst32)
 		}
 	}
 
 	fmt.Fprintln(w, "#undef _MA_JUMP")
+	fmt.Fprintln(w, "#undef _MA_JUMP_NEAR")
 	fmt.Fprintf(w, "return 0x%08X\n;", segHead+segSize)
 	fmt.Fprintf(w, "} /* _ma_code_func_0x%08X */\n", segHead)
 	fmt.Fprintln(w, "")
 	return nil
 }
 
-func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) error {
+func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 uint32) error {
 	fmt.Fprintf(w, "L_0x%08X:\n", instAddr)
 	if logrus.GetLevel() >= logrus.DebugLevel {
 		fmt.Fprintf(w, "_ma_regs_dump(0x%08X);\n", instAddr)
@@ -414,19 +423,20 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			}
 		case decoder.Branch:
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
+			stmt := generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 13)), segHead, segSize)
 			switch f3 := inst.GetFunct3(); f3 {
 			case decoder.Beq: // beq rs1,rs2,offset: if (x[rs1] == x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s == %s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if (%s == %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
-				fmt.Fprintf(w, "if (%s != %s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if (%s != %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] <u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s < %s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if (%s < %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
-				fmt.Fprintf(w, "if (%s >= %s) { _MA_JUMP(0x%08X); }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), instAddr+uint64(signext.SignExt(int(imm), 13)))
+				fmt.Fprintf(w, "if (%s >= %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			default:
 				return fmt.Errorf("unsupported Branch funct3 %+v", f3)
 			}
@@ -447,7 +457,7 @@ func generateCodeEntry(w io.Writer, segHead, instAddr uint64, inst32 uint32) err
 			if rd != 0 {
 				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
-			fmt.Fprintf(w, "_MA_JUMP(0x%08X);\n", instAddr+uint64(signext.SignExt(int(imm), 21)))
+			fmt.Fprintf(w, "%s;\n", generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 21)), segHead, segSize))
 		case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
 			if rd != 0 {
