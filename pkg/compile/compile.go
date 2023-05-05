@@ -66,10 +66,9 @@ func Compile(w io.Writer, r io.ReaderAt) error {
 	}
 	switch f.Class {
 	case elf.ELFCLASS32:
-		fmt.Fprintln(w, "#define _MA_REG_TYPE uint32_t")
+		fmt.Fprintln(w, "#define _MA_REG_WIDTH 32")
 	case elf.ELFCLASS64:
-		logrus.Warn("ELFCLASS64 is not properly supported yet")
-		fmt.Fprintln(w, "#define _MA_REG_TYPE uint64_t")
+		fmt.Fprintln(w, "#define _MA_REG_WIDTH 64")
 	default:
 		return fmt.Errorf("unknown ELF class %v", f.Class)
 	}
@@ -214,22 +213,31 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "typedef _ma_reg_t (*_ma_code_func_t)(_ma_reg_t pc);")
 	fmt.Fprintln(w, "")
 
+	var codeFuncsTableBuf bytes.Buffer
 	// The instructions are split to small "segments" to shorten the compilation time
-	const segSize uint64 = 1024
+	const defaultSegSize uint64 = 1024
 	textReader := textSec.Open()
-	for instAddr := textSec.Addr; instAddr < textSec.Addr+textSec.Size; instAddr += segSize {
-		currentSegSize := segSize
-		if instAddr+currentSegSize > textSec.Addr+textSec.Size {
-			currentSegSize = textSec.Addr + textSec.Size - instAddr
+	segNum := 0
+	for segHead, segFirstInstAddr := textSec.Addr, textSec.Addr; segHead < textSec.Addr+textSec.Size && segHead != 0; {
+		if expectedSegHead := textSec.Addr + uint64(segNum)*defaultSegSize; expectedSegHead != segHead {
+			panic(fmt.Errorf("expected seg head 0x%08X, got 0x%08X", expectedSegHead, segHead))
 		}
-		if err := generateCodeFunc(w, textReader, instAddr, currentSegSize); err != nil {
-			return fmt.Errorf("failed to generate the function (segmentation addr=0x%08X, size=%d): %w", instAddr, currentSegSize, err)
+		if _, err := textReader.Seek(int64(segFirstInstAddr-textSec.Addr), io.SeekStart); err != nil {
+			return err
 		}
+		logrus.Debugf("Segment %d: addr=0x%08X", segNum, segHead)
+		nextSegHead, nextSegFirstInstAddr, err := generateCodeFunc(w, textReader, &elfFile.FileHeader, textSec.Addr, segHead, segFirstInstAddr, defaultSegSize)
+		if err != nil {
+			return fmt.Errorf("failed to generate the function (segment %d addr=0x%08X): %w", segNum, segHead, err)
+		}
+		fmt.Fprintf(&codeFuncsTableBuf, "&_ma_code_func_0x%08X, /* %d */\n", segHead, segNum)
+		segHead, segFirstInstAddr = nextSegHead, nextSegFirstInstAddr
+		segNum++
 	}
 
 	fmt.Fprintln(w, "_ma_code_func_t _ma_code_funcs[] = {")
-	for instAddr := textSec.Addr; instAddr < textSec.Addr+textSec.Size; instAddr += segSize {
-		fmt.Fprintf(w, "&_ma_code_func_0x%08X,\n", instAddr)
+	if _, err := io.Copy(w, &codeFuncsTableBuf); err != nil {
+		return err
 	}
 	fmt.Fprintln(w, "}; /* _ma_code_funcs */")
 	fmt.Fprintln(w, "")
@@ -240,9 +248,18 @@ func generateMain(w io.Writer, elfFile *elf.File, textSec *elf.Section) error {
 	fmt.Fprintln(w, "_ma_vma_stack_entry_init(argc, argv);")
 	fmt.Fprintf(w, "_ma_reg_t pc = 0x%08X;\n", elfFile.Entry)
 	fmt.Fprintln(w, "while(1) {")
-	fmt.Fprintf(w, "int f_idx = (pc - 0x%08X) / %d;\n", textSec.Addr, segSize)
+	fmt.Fprintf(w, "int f_idx = (pc - 0x%08X) / %d;\n", textSec.Addr, defaultSegSize)
+	if logrus.GetLevel() >= logrus.DebugLevel {
+		w.Write([]byte("_MA_DEBUGF(\"===== Segment %d (for PC=0x%08\"_MA_PRIx\") =====\", f_idx, pc);"))
+		fmt.Fprintf(w, "if (f_idx >= %d) {\n", segNum)
+		fmt.Fprintln(w, "_MA_FATALF(\"invalid f_idx\");")
+		fmt.Fprintln(w, "} /* if */")
+	}
 	fmt.Fprintln(w, "_ma_code_func_t f = _ma_code_funcs[f_idx];")
 	fmt.Fprintln(w, "pc = f(pc);")
+	if logrus.GetLevel() >= logrus.DebugLevel {
+		w.Write([]byte("_MA_DEBUGF(\"The next segment will begin for PC=0x%08\"_MA_PRIx, pc);"))
+	}
 	fmt.Fprintln(w, "} /* while(1) */")
 	fmt.Fprintln(w, "} /* main */")
 	fmt.Fprintln(w, "")
@@ -259,52 +276,122 @@ func generateReadRegExpr(reg decoder.RegisterIndex) string {
 }
 
 func generateStaticJumpStmt(addr, segHead, segSize uint64) string {
+	var stmt string
 	if (addr - segHead) < segSize {
-		return fmt.Sprintf("goto L_0x%08X;", addr)
+		if logrus.GetLevel() >= logrus.DebugLevel {
+			stmt += fmt.Sprintf("_MA_DEBUGF(\"JUMP NEAR STATIC 0x%08X\");", addr)
+		}
+		stmt += fmt.Sprintf("goto L_0x%08X;", addr)
+	} else {
+		stmt += fmt.Sprintf("_MA_DEBUGF(\"JUMP FAR STATIC 0x%08X\");", addr)
+		stmt += fmt.Sprintf("return 0x%08X;", addr)
 	}
-	return fmt.Sprintf("return 0x%08X;", addr)
+	return stmt
 }
 
-func generateCodeFunc(w io.Writer, r io.Reader, segHead, segSize uint64) error {
+func generateCodeFunc(w io.Writer, r io.Reader, elfHeader *elf.FileHeader, textHead, segHead, segFirstInstAddr, defaultSegSize uint64) (nextSegHead, nextSegFirstInstAddr uint64, err error) {
 	fmt.Fprintf(w, "_ma_reg_t static _ma_code_func_0x%08X(_ma_reg_t pc_initial){\n", segHead)
-	fmt.Fprintln(w, "const static void *addr_labels[] = {")
-	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
-		fmt.Fprintf(w, "&&L_0x%08X,\n", instAddr)
-	}
-	fmt.Fprintln(w, "}; /* addr_labels */")
-	fmt.Fprintf(w, "#define _MA_JUMP(addr) __MA_JUMP((addr), 0x%08X, %d, addr_labels)\n", segHead, segSize)
-	fmt.Fprintf(w, "#define _MA_JUMP_NEAR(addr) __MA_JUMP_NEAR((addr), 0x%08X, addr_labels)\n", segHead)
+
 	fmt.Fprintln(w, "/* Temp variables */")
+	fmt.Fprintln(w, "_ma_reg_t tmp;")
 	fmt.Fprintln(w, "uint8_t u8;")
 	fmt.Fprintln(w, "uint16_t u16;")
 	fmt.Fprintln(w, "uint32_t u32, u32_x, u32_y;")
+	fmt.Fprintln(w, "uint64_t u64, u64_x, u64_y;")
 	fmt.Fprintln(w, "void *p;")
-	fmt.Fprintln(w, "_MA_JUMP_NEAR(pc_initial);")
 
-	for instAddr := segHead; instAddr < segHead+segSize; instAddr += 4 {
-		var inst32 uint32
-		if err := binary.Read(r, binary.LittleEndian, &inst32); err != nil {
-			return err
+	var (
+		labelsBuf, codeBuf bytes.Buffer
+		eof                bool
+	)
+
+	if segHead > segFirstInstAddr {
+		panic(fmt.Errorf("segHead 0x%08X must be <= segFirstInstAddr 0x%08X", segHead, segFirstInstAddr))
+	}
+	for i := segHead; i < segFirstInstAddr; i += 2 {
+		fmt.Fprintln(&labelsBuf, "NULL,") // padding
+	}
+
+	instAddr := segFirstInstAddr
+	for instAddr < segHead+defaultSegSize {
+		var inst16l uint16
+		if err = binary.Read(r, binary.LittleEndian, &inst16l); err != nil {
+			if errors.Is(err, io.EOF) {
+				eof = true
+			} else {
+				return
+			}
 		}
-		if err := generateCodeEntry(w, segHead, segSize, instAddr, inst32); err != nil {
-			return fmt.Errorf("%w (addr=0x%08X, instruction=0x%08X)", err, instAddr, inst32)
+		uncompressed := inst16l&0b11 == 0b11
+		var (
+			inst32      uint32
+			lastInstLen int
+		)
+		if uncompressed {
+			// Instruction length: 4 bytes
+			lastInstLen = 4
+			var inst16h uint16
+			if err = binary.Read(r, binary.LittleEndian, &inst16h); err != nil {
+				return
+			}
+			inst32 = uint32(inst16h)<<16 | uint32(inst16l)
+		} else {
+			// Instruction length: 2 bytes
+			lastInstLen = 2
+			inst32 = uint32(inst16l)
 		}
+		inst := decoder.NewRawInstruction(inst32)
+		if err := generateCodeEntry(&codeBuf, elfHeader, segHead, defaultSegSize, instAddr, inst); err != nil {
+			errS := fmt.Sprintf("%v (addr=0x%08X, instruction=0x%08X)", err, instAddr, inst32)
+			logrus.Error(errS)
+			fmt.Fprintf(&codeBuf, "_MA_FATALF(%q);\n", errS)
+		}
+		fmt.Fprintf(&labelsBuf, "&&L_0x%08X,\n", instAddr)
+		if uncompressed {
+			fmt.Fprintln(&labelsBuf, "NULL,") // padding
+		}
+		instAddr += uint64(lastInstLen)
+	}
+
+	actualSegSize := instAddr - segHead
+	logrus.Debugf("actual segment size=%d", actualSegSize)
+	if !eof {
+		nextSegHead = segHead + defaultSegSize
+		nextSegFirstInstAddr = instAddr
+	}
+
+	fmt.Fprintln(w, "const static void *addr_labels[] = {")
+	if _, err = io.Copy(w, &labelsBuf); err != nil {
+		return
+	}
+	fmt.Fprintln(w, "}; /* addr_labels */")
+
+	fmt.Fprintf(w, "#define _MA_JUMP(addr) __MA_JUMP((addr), 0x%08X, %d, addr_labels)\n", segHead, actualSegSize)
+	fmt.Fprintf(w, "#define _MA_JUMP_NEAR(addr) __MA_JUMP_NEAR((addr), 0x%08X, addr_labels)\n", segHead)
+	fmt.Fprintln(w, "_MA_JUMP_NEAR(pc_initial);")
+	if _, err = io.Copy(w, &codeBuf); err != nil {
+		return
 	}
 
 	fmt.Fprintln(w, "#undef _MA_JUMP")
 	fmt.Fprintln(w, "#undef _MA_JUMP_NEAR")
-	fmt.Fprintf(w, "return 0x%08X\n;", segHead+segSize)
+	if eof {
+		fmt.Fprintln(w, "_MA_FATALF(\"EOF\");")
+	}
+	fmt.Fprintf(w, "return 0x%08X;\n", nextSegFirstInstAddr)
 	fmt.Fprintf(w, "} /* _ma_code_func_0x%08X */\n", segHead)
 	fmt.Fprintln(w, "")
-	return nil
+	return
 }
 
-func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 uint32) error {
-	fmt.Fprintf(w, "L_0x%08X:\n", instAddr)
+func generateCodeEntry(w io.Writer, elfHeader *elf.FileHeader, segHead, segSize, instAddr uint64, inst decoder.RawInstruction) error {
+	fmt.Fprintf(w, "L_0x%08X: /* 0x%08X */\n", instAddr, inst.BinWord)
 	if logrus.GetLevel() >= logrus.DebugLevel {
 		fmt.Fprintf(w, "_ma_regs_dump(0x%08X);\n", instAddr)
 	}
-	inst := decoder.NewRawInstruction(inst32)
+	f3 := inst.GetFunct3()
+	f7 := inst.GetFunct7()
+	bit12 := decoder.Bit12((inst.BinWord >> 12) & 0b1)
 	switch inst.MajOp {
 	case decoder.Std:
 		switch minorOp := inst.GetMinorOpcode(); minorOp {
@@ -313,39 +400,95 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 			if rd == 0 {
 				break
 			}
-			switch f3 := inst.GetFunct3(); f3 {
-			case decoder.RegDiff:
-				switch f7 := inst.GetFunct7(); f7 {
-				case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-				case decoder.Sub: // sub rd,rs1,rs2: x[rd] = x[rs1] - x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = %s - %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+			switch f7 {
+			case decoder.MulDiv:
+				switch f3 {
+				case decoder.Mul: // mul rd,rs1,rs2: x[rd] = x[rs1] * x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%s * (_ma_signed_reg_t)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Div: // div rd,rs1,rs2: x[rd] = x[rs1] /s x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%s / (_ma_signed_reg_t)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Divu: // divu rd,rs1,rs2: x[rd] = x[rs1] /u x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s / %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Rem: // rem rd,rs1,rs2: x[rd] = x[rs1] %s x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%s %% (_ma_signed_reg_t)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Remu: // remu rd,rs1,rs2: x[rd] = x[rs1] %u x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s %% %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 				default:
-					return fmt.Errorf("unsupported RegReg funct7 %+v", f7)
+					return fmt.Errorf("unsupported MulDiv %+v", f3)
 				}
-			case decoder.Sll: // sll rd,rs1,rs2: x[rd] = x[rs1] << x[rs2]
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-			case decoder.Slt: // slt rd,rs1,rs2: x[rd] = x[rs1] <s x[rs2]:
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-			case decoder.Sltu: // sltu rd,rs1,rs2: x[rd] = x[rs1] <u x[rs2]:
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s < %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-			case decoder.Xor: // xor rd,rs1,rs2: x[rd] = x[rs1] ^ x[rs2]
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-			case decoder.RegShift:
-				switch f7 := inst.GetFunct7(); f7 {
-				case decoder.Srl: // srl rd,rs1,rs2: x[rd] = x[rs1] >>u x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-				case decoder.Sra: // sra rd,rs1,rs2: x[rd] = x[rs1] >>s x[rs2]
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-				default:
-					return fmt.Errorf("unsupported RegReg funct7 %+v", f7)
-				}
-			case decoder.Or: // or rd,rs1,rs2: x[rd] = x[rs1] | x[rs2]
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s | %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
-			case decoder.And: // and rd,rs1,rs2: x[rd] = x[rs1] & x[rs2]
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s & %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 			default:
-				return fmt.Errorf("unsupported RegReg funct3 %+v", f3)
+				switch f3 {
+				case decoder.RegDiff:
+					switch f7 {
+					case decoder.Add: // add rd,rs1,rs2: x[rd] = x[rs1] + x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = %s + %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					case decoder.Sub: // sub rd,rs1,rs2: x[rd] = x[rs1] - x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = %s - %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					default:
+						return fmt.Errorf("unsupported RegReg funct7 %+v", f7)
+					}
+				case decoder.Sll: // sll rd,rs1,rs2: x[rd] = x[rs1] << x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Slt: // slt rd,rs1,rs2: x[rd] = x[rs1] <s x[rs2]:
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%s < (_ma_signed_reg_t)%s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Sltu: // sltu rd,rs1,rs2: x[rd] = x[rs1] <u x[rs2]:
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s < %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.Xor: // xor rd,rs1,rs2: x[rd] = x[rs1] ^ x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.RegShift:
+					switch f7 {
+					case decoder.Srl: // srl rd,rs1,rs2: x[rd] = x[rs1] >>u x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = (%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					case decoder.Sra: // sra rd,rs1,rs2: x[rd] = x[rs1] >>s x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = ((_ma_signed_reg_t)%s >> (%s & 0x1f));\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					default:
+						return fmt.Errorf("unsupported RegReg funct7 %+v", f7)
+					}
+				case decoder.Or: // or rd,rs1,rs2: x[rd] = x[rs1] | x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s | %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				case decoder.And: // and rd,rs1,rs2: x[rd] = x[rs1] & x[rs2]
+					fmt.Fprintf(w, "_ma_regs.x[%d] = %s & %s;\n", rd, generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+				default:
+					return fmt.Errorf("unsupported RegReg funct3 %+v", f3)
+				}
+			}
+		case decoder.IntRegReg32:
+			rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2()
+			if rd == 0 {
+				break
+			}
+			switch f3 {
+			case 0:
+				switch f7 {
+				case decoder.Add: /* addw rd,rs1,rs2: x[rd] = sext((x[rs1] + x[rs2])[31:0]) */
+					if elfHeader.Class == elf.ELFCLASS32 {
+						return errors.New("addw: invalid for RV32")
+					}
+					fmt.Fprintf(w, "u32 = (uint32_t)(%s + %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				case decoder.Sub: /* subw rd,rs1,rs2: x[rd] = sext((x[rs1] - x[rs2])[31:0]) */
+					if elfHeader.Class == elf.ELFCLASS32 {
+						return errors.New("subw: invalid for RV32")
+					}
+					fmt.Fprintf(w, "u32 = (uint32_t)(%s - %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				default:
+					return fmt.Errorf("unsupported IntRegReg32 funct3 %+v funct7 %+v", f3, f7)
+				}
+			case 1:
+				switch f7 {
+				case 0: /* sllw rd,rs1,rs2: x[rd] = sext((x[rs1] << x[rs2][4:0])[31:0]) */
+					if elfHeader.Class == elf.ELFCLASS32 {
+						return errors.New("slli: invalid for RV32")
+					}
+					shamt := rs2 & 0b11111 // 5 bits
+					fmt.Fprintf(w, "u32 = (uint32_t)(%s << %d);\n", generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				default:
+					return fmt.Errorf("unsupported IntRegReg32 funct3 %+v funct7 %+v", f3, f7)
+				}
+			default:
+				return fmt.Errorf("unsupported IntRegReg32 funct3 %+v", f3)
 			}
 		case decoder.IntRegImm:
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
@@ -353,62 +496,132 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 				break
 			}
 			shamt := imm & 0b11111
-			switch f3 := inst.GetFunct3(); f3 {
+			switch f3 {
 			case decoder.Addi: // addi rd,rs1,imm: x[rd] = x[rs1] + sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s + (_ma_signed_reg_t)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Slli: // slli rd,rs1,shamt: x[rd] = x[rs1] << shamt
 				fmt.Fprintf(w, "_ma_regs.x[%d] = %s << %d;\n", rd, generateReadRegExpr(rs1), shamt)
 			case decoder.Sr:
-				switch f7 := inst.GetFunct7(); f7 {
+				switch f7 {
+				case 1: // srli with shamt[5] == 1 (RV64 only)
+					if elfHeader.Class == elf.ELFCLASS64 {
+						shamt |= 0b100000
+					}
+					fallthrough
 				case decoder.Srl: // srli rd,rs1,shamt: x[rd] = x[rs1] >>u shamt // logical shift
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((unsigned)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
+				case 33: // srai with shamt[5] == 1 (RV64 only)
+					if elfHeader.Class == elf.ELFCLASS64 {
+						shamt |= 0b100000
+					}
+					fallthrough
 				case decoder.Sra: // srai rd,rs1,shamt: x[rd] = x[rs1] >>s shamt // arithmetic shift
-					fmt.Fprintf(w, "_ma_regs.x[%d] = ((signed)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = ((_ma_signed_reg_t)%s >> %d);\n", rd, generateReadRegExpr(rs1), shamt)
 				default:
 					return fmt.Errorf("unsupported IntRegImm funct7 %+v", f7)
 				}
 			case decoder.Slti: // slti rd,rs1,imm: x[rd] = x[rs1] <s sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%s < (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%s < (_ma_signed_reg_t)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Sltiu: // sltiu rd,rs1,imm: x[rd] = x[rs1] <u sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (unsigned) %s < (unsigned)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s < %d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Andi: // andi rd,rs1,imm: x[rd] = x[rs1] & sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s & (_ma_signed_reg_t)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Xori: // xori rd,rs1,imm: x[rd] = x[rs1] ^ sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s ^ (_ma_signed_reg_t)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			case decoder.Ori: // ori rd,rs1,imm: x[rd] = x[rs1] | sext(immediate)
-				fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (signed)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = %s | (_ma_signed_reg_t)%d;\n", rd, generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
 			default:
 				return fmt.Errorf("unsupported IntRegImm funct3 %+v", f3)
+			}
+		case decoder.IntRegImm32:
+			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+			if rd == 0 {
+				break
+			}
+			shamt := imm & 0b111111 // 6 bits
+			switch f3 {
+			case decoder.Addi: // addiw rd,rs1,imm: x[rd] = sext((x[rs1] + sext(immediate))[31:0])
+				if elfHeader.Class == elf.ELFCLASS32 {
+					return errors.New("addi: invalid for RV32")
+				}
+				fmt.Fprintf(w, "u32 = (uint32_t)(%s + (_ma_signed_reg_t)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+				fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+			case decoder.Slli: // slliw rd,rs1,shamt: x[rd] = sext((x[rs1] << shamt)[31:0])
+				if elfHeader.Class == elf.ELFCLASS32 {
+					return errors.New("slliw: invalid for RV32")
+				}
+				if shamt&0b11111 != shamt { // 5 bits
+					return fmt.Errorf("slliw: expected shamt to be <= 0b11111, got %b", shamt)
+				}
+				fmt.Fprintf(w, "u32 = (uint32_t)(%s << %d);\n", generateReadRegExpr(rs1), shamt)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+			case decoder.Sr:
+				switch f7 {
+				case decoder.Srl: // sralw rd,rs1,shamt: x[rd] = sext(x[rs1][31:0] >>u shamt)
+					if elfHeader.Class == elf.ELFCLASS32 {
+						return errors.New("sralw: invalid for RV32")
+					}
+					if shamt&0b11111 != shamt { // 5 bits
+						return fmt.Errorf("sralw: expected shamt to be <= 0b11111, got %b", shamt)
+					}
+					fmt.Fprintf(w, "u32 = (%s >> %d);\n", generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				case decoder.Sra: // sraiw rd,rs1,shamt: x[rd] = sext(x[rs1][31:0] >>s shamt)
+					if elfHeader.Class == elf.ELFCLASS32 {
+						return errors.New("sraiw: invalid for RV32")
+					}
+					if shamt&0b11111 != shamt { // 5 bits
+						return fmt.Errorf("sraiw: expected shamt to be <= 0b11111, got %b", shamt)
+					}
+					fmt.Fprintf(w, "u32 = ((_ma_signed_reg_t)%s >> %d);\n", generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				default:
+					return fmt.Errorf("unsupported IntRegImm32 funct7 %+v", f7)
+				}
+			default:
+				return fmt.Errorf("unsupported IntRegImm32 funct3 %+v", f3)
 			}
 		case decoder.Load:
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
-			switch f3 := inst.GetFunct3(); f3 {
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (_ma_signed_reg_t)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+			switch f3 {
 			case decoder.Lb: // lb rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][7:0])
 				fmt.Fprintln(w, "u8 = *(uint8_t*)p;")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u8, 8);\n", rd)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_reg_t)_MA_SIGN_EXT((_ma_reg_t)u8, 8);\n", rd)
 			case decoder.Lbu: // lbu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][7:0]
 				fmt.Fprintln(w, "u8 = *(uint8_t*)p;")
 				fmt.Fprintf(w, "_ma_regs.x[%d] = u8;\n", rd)
 			case decoder.Lh: // lh rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][15:0])
 				fmt.Fprintln(w, "u16 = *(uint16_t*)p;")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u16, 16);\n", rd)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_reg_t)_MA_SIGN_EXT((_ma_reg_t)u16, 16);\n", rd)
 			case decoder.Lhu: // lhu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][15:0]
 				fmt.Fprintln(w, "u16 = *(uint16_t*)p;")
 				fmt.Fprintf(w, "_ma_regs.x[%d] = u16;\n", rd)
 			case decoder.Lw: // lw rd,offset(rs1): x[rd] = sext(M[x[rs1] + sext(offset)][31:0])
 				fmt.Fprintln(w, "u32 = *(uint32_t*)p;")
-				fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)_MA_SIGN_EXT((_ma_reg_t)u32, 32);\n", rd)
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_reg_t)_MA_SIGN_EXT((_ma_reg_t)u32, 32);\n", rd)
+			case decoder.Lwu: // lwu rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][31:0]
+				if elfHeader.Class == elf.ELFCLASS32 {
+					return errors.New("lwu: invalid for RV32")
+				}
+				fmt.Fprintln(w, "u32 = *(uint32_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = u32;\n", rd)
+			case decoder.Ld: // ld rd,offset(rs1): x[rd] = M[x[rs1] + sext(offset)][63:0]
+				if elfHeader.Class == elf.ELFCLASS32 {
+					return errors.New("ld: invalid for RV32")
+				}
+				fmt.Fprintln(w, "u64 = *(uint64_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = u64;\n", rd)
 			default:
 				return fmt.Errorf("unsupported Load funct3 %+v", f3)
 			}
 		case decoder.Store:
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
-			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (signed)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
-			switch f3 := inst.GetFunct3(); f3 {
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (_ma_signed_reg_t)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+			switch f3 {
 			case decoder.Sb: // sb rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][7:0]]
 				fmt.Fprintf(w, "u8 = %s & 0xFF;\n", generateReadRegExpr(rs2))
 				fmt.Fprintln(w, "*(uint8_t*)p = u8;")
@@ -418,23 +631,29 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 			case decoder.Sw: // sw rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][31:0]]
 				fmt.Fprintf(w, "u32 = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs2))
 				fmt.Fprintln(w, "*(uint32_t*)p = u32;")
+			case decoder.Sd: // sd rs2,offset(rs1): M[x[rs1] + sext(offset)] = x[rs2][63:0]
+				if elfHeader.Class == elf.ELFCLASS32 {
+					return errors.New("sd: invalid for RV32")
+				}
+				fmt.Fprintf(w, "u64 = %s;\n", generateReadRegExpr(rs2))
+				fmt.Fprintln(w, "*(uint64_t*)p = u64;")
 			default:
 				return fmt.Errorf("unsupported Store funct3 %+v", f3)
 			}
 		case decoder.Branch:
 			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
 			stmt := generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 13)), segHead, segSize)
-			switch f3 := inst.GetFunct3(); f3 {
+			switch f3 {
 			case decoder.Beq: // beq rs1,rs2,offset: if (x[rs1] == x[rs2]) pc += sext(offset)
 				fmt.Fprintf(w, "if (%s == %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bne: // bne rs1,rs2,offset: if (x[rs1] != x[rs2]) pc += sext(offset)
 				fmt.Fprintf(w, "if (%s != %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Blt: // blt rs1,rs2,offset: if (x[rs1] <s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s < (signed)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
+				fmt.Fprintf(w, "if ((_ma_signed_reg_t)%s < (_ma_signed_reg_t)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bltu: // bltu rs1,rs2,offset: if (x[rs1] <u x[rs2]) pc += sext(offset) // unsigned
 				fmt.Fprintf(w, "if (%s < %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bge: // bge rs1,rs2,offset: if (x[rs1] >=s x[rs2]) pc += sext(offset) // signed
-				fmt.Fprintf(w, "if ((signed)%s >= (signed)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
+				fmt.Fprintf(w, "if ((_ma_signed_reg_t)%s >= (_ma_signed_reg_t)%s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			case decoder.Bgeu: // bgeu rs1,rs2,offset: if (x[rs1] >=u x[rs2]) pc += sext(offset) // unsigned
 				fmt.Fprintf(w, "if (%s >= %s) { %s }\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2), stmt)
 			default:
@@ -445,7 +664,7 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 			if rd == 0 {
 				break
 			}
-			fmt.Fprintf(w, "_ma_regs.x[%d] = (signed)%d;\n", rd, signext.SignExt(int(imm), 32))
+			fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%d;\n", rd, signext.SignExt(int(imm), 32))
 		case decoder.Auipc: // auipc rd,imm: x[rd] = pc + sext(immediate[31:12] << 12)
 			rd, imm := inst.GetRd(), inst.GetImmediate()
 			if rd == 0 {
@@ -460,19 +679,25 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 			fmt.Fprintf(w, "%s;\n", generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 21)), segHead, segSize))
 		case decoder.Jalr: // jalr rd,rs1,offset: t =pc+4; pc=(x[rs1]+sext(offset))&∼1; x[rd]=t
 			rd, rs1, imm := inst.GetRd(), inst.GetRs1(), inst.GetImmediate()
+			fmt.Fprintf(w, "tmp = %s;\n", generateReadRegExpr(rs1))
 			if rd != 0 {
 				fmt.Fprintf(w, "_ma_regs.x[%d] = 0x%08X;\n", rd, instAddr+4)
 			}
-			fmt.Fprintf(w, "_MA_JUMP((%s + (signed)%d)&~1);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+			fmt.Fprintf(w, "_MA_JUMP((tmp + (_ma_signed_reg_t)%d)&~1);\n", signext.SignExt(int(imm), 12))
 		case decoder.Sys:
-			fmt.Fprintln(w, "_ma_ecall();")
+			switch bit20 := (inst.BinWord >> 20) & 0b1; bit20 {
+			case 0: // ebreak: RaiseException(Breakpoint)
+				fmt.Fprintln(w, "_ma_ecall();")
+			case 1: // ecall: RaiseException(EnvironmentCall)
+				fmt.Fprintf(w, "_MA_RAISE_BREAK(0x%08X);\n", instAddr)
+			}
 		case decoder.FenceOp: // WIP, probably wrong
 			fmt.Fprintln(w, "/* NOP */;")
 		case decoder.Atomic:
 			rd, rs1, rs2 := inst.GetRd(), inst.GetRs1(), inst.GetRs2() // often rd == rs2
 			fmt.Fprintf(w, "p = _ma_translate_ptr(%s);\n", generateReadRegExpr(rs1))
-			f5head, f5tail := decoder.Funct5Head(inst32>>29), decoder.Funct5Tail((inst32>>27)&0x3)
-			switch f3 := inst.GetFunct3(); f3 {
+			f5head, f5tail := decoder.Funct5Head(inst.BinWord>>29), decoder.Funct5Tail((inst.BinWord>>27)&0x3)
+			switch f3 {
 			case decoder.Atomic32: // WIP, needs mutex
 				switch f5head {
 				case decoder.CommonAtomic:
@@ -524,11 +749,362 @@ func generateCodeEntry(w io.Writer, segHead, segSize, instAddr uint64, inst32 ui
 				default:
 					return fmt.Errorf("unsupported Atomic32 funct5head %+v", f5head)
 				}
+			case decoder.Atomic64: // WIP, needs mutex
+				switch f5head {
+				case decoder.CommonAtomic:
+					switch f5tail {
+					case decoder.ArithAtomic: // amoadd.d rd,rs2,(rs1): x[rd] = AMO64(M[x[rs1]] + x[rs2])
+						fmt.Fprintln(w, "u64_x = *(uint64_t*)p;")
+						fmt.Fprintf(w, "u64_y = u64_x + %s\n;", generateReadRegExpr(rs2))
+						if rd != 0 {
+							fmt.Fprintf(w, "_ma_regs.x[%d] = u64_x;\n", rd)
+						}
+						fmt.Fprintln(w, "*(uint64_t*)p = u64_y;")
+					case decoder.Amoswap: // amoswap.d rd,rs2,(rs1): x[rd] = AMO64(M[x[rs1]] SWAP x[rs2])
+						fmt.Fprintln(w, "u64_x = *(uint64_t*)p;")
+						fmt.Fprintf(w, "u64_y = %s\n;", generateReadRegExpr(rs2))
+						if rd != 0 {
+							fmt.Fprintf(w, "_ma_regs.x[%d] = u64_x;\n", rd)
+						}
+						fmt.Fprintln(w, "*(uint64_t*)p = u64_y;")
+					case decoder.Lr: // lr.d rd,rs1: x[rd] = LoadReserved64(M[x[rs1]])
+						if rd == 0 {
+							break
+						}
+						fmt.Fprintln(w, "u64_x = *(uint64_t*)p;")
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u64_x;\n", rd)
+						// TODO: implement reservation set
+					case decoder.Sc: // sc.d rd,rs1,rs2: x[rd] = StoreConditional64(M[x[rs1]], x[rs2])
+						fmt.Fprintf(w, "u64_y = %s;", generateReadRegExpr(rs2))
+						fmt.Fprintln(w, "*(uint64_t*)p = u64_y;")
+						if rd != 0 {
+							fmt.Fprintf(w, "_ma_regs.x[%d] = 0;\n", rd)
+						}
+					default:
+						return fmt.Errorf("unsupported Atomic64 CommonAtomic funct5tail %+v", f5tail)
+					}
+				case decoder.Amoor: // amoor.d rd,rs2,(rs1): x[rd] = AMO64(M[x[rs1]] | x[rs2])
+					fmt.Fprintln(w, "u64_x = *(uint64_t*)p;")
+					fmt.Fprintf(w, "u64_y = u64_x | %s\n;", generateReadRegExpr(rs2))
+					if rd != 0 {
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u64_x;\n", rd)
+					}
+					fmt.Fprintln(w, "*(uint64_t*)p = u64_y;")
+				case decoder.Amomaxu: // amomaxu.d rd,rs2,(rs1): x[rd] = AMO64(M[x[rs1]] MAXU x[rs2])
+					fmt.Fprintln(w, "u64_x = *(uint64_t*)p;")
+					fmt.Fprintf(w, "u64_y = MAX(u64_x, %s)\n;", generateReadRegExpr(rs2))
+					if rd != 0 {
+						fmt.Fprintf(w, "_ma_regs.x[%d] = u64_x;\n", rd)
+					}
+					fmt.Fprintln(w, "*(uint64_t*)p = u64_y;")
+				default:
+					return fmt.Errorf("unsupported Atomic64 funct5head %+v", f5head)
+				}
 			default:
 				return fmt.Errorf("unsupported Atomic funct3 %+v", f3)
 			}
+		case decoder.Flw:
+			return errors.New("unsupported: flw")
+		case decoder.Fsw: // fsw rs2,offset(rs1): M[x[rs1] + sext(offset)] = f[rs2][31:0]
+			rs1, rs2, imm := inst.GetRs1(), inst.GetRs2(), inst.GetImmediate()
+			fmt.Fprintf(w, "p = _ma_translate_ptr(%s + (_ma_signed_reg_t)%d);\n", generateReadRegExpr(rs1), signext.SignExt(int(imm), 12))
+			fmt.Fprintf(w, "*(float*)p = (float)_ma_regs.f[%d];\n", rs2)
 		default:
 			return fmt.Errorf("unsupported minor opcode 0x%02X", minorOp)
+		}
+	case decoder.C0:
+		switch cf3 := inst.CFunct3(); cf3 {
+		case decoder.Caddi4spn:
+			if inst.BinWord == 0 {
+				fmt.Fprintln(w, "/* NOTREACHED */")
+				fmt.Fprintln(w, "_MA_FATALF(\"null instruction\");")
+			} else {
+				rd, uimm := inst.CRdShort(), inst.CADDI4Imm()
+				switch rd {
+				case 0: // reserved
+					return errors.New("reserved instruction")
+				default: // c.addi4spn rd’,uimm: x[8+rd’] = x[2] + nzuimm
+					if uimm == 0 {
+						return errors.New("c.addi4spn: uimm must not be zero")
+					}
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.x[2] + (_ma_reg_t)%d;\n", rd, uimm)
+				}
+			}
+		case decoder.Cfld: // c.fld rd’,uimm(rs1’): f[8+rd’] = M[x[8+rs1’] + uimm][63:0]
+			return errors.New("unsupported: c.fld")
+		case decoder.Clw: // c.lw rd’,uimm(rs1’): x[8+rd’] = sext(M[x[8+rs1’] + uimm][31:0])
+			rd, rs1, uimm := inst.CRdShort(), inst.CRdRs1Short(), inst.CWImm()
+			fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[%d] + (_ma_reg_t)%d);\n", rs1, uimm)
+			fmt.Fprintln(w, "u32 = *(uint32_t*)p;")
+			fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32,32);\n", rd)
+		case decoder.Cflw: // c.flw (32-bit ABI) or c.ld (64-bit ABI)
+			switch elfHeader.Class {
+			case elf.ELFCLASS32: // c.flw rd’,uimm(rs1’): f[8+rd’] = M[x[8+rs1’] + uimm][31:0]
+				return errors.New("unsupported: c.flw")
+			case elf.ELFCLASS64: // c.ld rd’,uimm(rs1’): x[8+rd’] = M[x[8+rs1’] + uimm][63:0]
+				rd, rs1, uimm := inst.CRdShort(), inst.CRdRs1Short(), inst.CDImm()
+				fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[%d] + (_ma_reg_t)%d);\n", rs1, uimm)
+				fmt.Fprintln(w, "u64 = *(uint64_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = u64;\n", rd)
+			}
+		case decoder.Cfsd: // c.fsd rd’,uimm(rs1’): M[x[8+rs1’] + uimm][63:0] = f[8+rs2’]
+			rs1, rs2, uimm := inst.CRdRs1Short(), inst.CRs2Short(), inst.CWImm()
+			fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[%d] + (_ma_reg_t)%d);\n", rs1, uimm)
+			fmt.Fprintf(w, "*(double*)p = _ma_regs.f[%d];\n", rs2)
+		case decoder.Csw: // c.sw rd’,uimm(rs1’): M[x[8+rs1’] + uimm][31:0] = x[8+rs2’]
+			rs1, rs2, uimm := inst.CRdRs1Short(), inst.CRs2Short(), inst.CWImm()
+			fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[%d] + (_ma_reg_t)%d);\n", rs1, uimm)
+			fmt.Fprintf(w, "u32 = (uint32_t)_ma_regs.x[%d];\n", rs2)
+			fmt.Fprintln(w, "*(uint32_t*)p = u32;")
+		case decoder.Cfsw: // c.fsw (32-bit ABI) or c.sd (64-bit ABI)
+			switch elfHeader.Class {
+			case elf.ELFCLASS32:
+				return errors.New("unsupported: c.fsw")
+			case elf.ELFCLASS64: // c.sd rd’,uimm(rs1’): M[x[8+rs1’] + uimm][63:0] = x[8+rs2’]
+				rs1, rs2, uimm := inst.CRdRs1Short(), inst.CRs2Short(), inst.CDImm()
+				fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[%d] + (_ma_reg_t)%d);\n", rs1, uimm)
+				fmt.Fprintf(w, "u64 = (uint64_t)_ma_regs.x[%d];\n", rs2)
+				fmt.Fprintln(w, "*(uint64_t*)p = u64;")
+			}
+		default:
+			return fmt.Errorf("unsupported C0 cfunct3 %+v", cf3)
+		}
+	case decoder.C1:
+		switch cf3 := inst.CFunct3(); cf3 {
+		case decoder.Caddi: // c.addi or c.nop
+			rd, imm := inst.CRdRs1(), inst.CIImm()
+			switch rd {
+			case 0: // c.nop
+				fmt.Fprintln(w, "/* NOP */")
+			default: // c.addi rd,u[12:12]|u[6:2]: x[rd] = x[rd] + sext(imm)
+				switch imm {
+				case 0:
+					logrus.Warn("unsupported: HINT for c.addi")
+					fallthrough
+				default:
+					fmt.Fprintf(w, "_ma_regs.x[%d] += (_ma_signed_reg_t)%d;\n", rd, signext.SignExt(int(imm), 6))
+				}
+			}
+		case decoder.Cjal: // c.jal (32-bit ABI) or c.addiw (64-bit ABI)
+			switch elfHeader.Class {
+			case elf.ELFCLASS32:
+				return errors.New("unsupported: c.jal")
+			case elf.ELFCLASS64:
+				rd, imm := inst.CRdRs1(), inst.CIImm()
+				switch rd {
+				case 0: // reserved
+					return errors.New("reserved instruction")
+				default: // c.addiw rd,imm: x[rd] = sext((x[rd] + sext(imm))[31:0])
+					fmt.Fprintf(w, "u32 = (uint32_t)(_ma_regs.x[%d] + (_ma_signed_reg_t)%d);\n", rd, signext.SignExt(int(imm), 6))
+					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+				}
+			}
+		case decoder.Cli: // c.li rd,imm: x[rd] = sext(imm)
+			rd, imm := inst.CRdRs1(), inst.CIImm()
+			switch rd {
+			case 0:
+				logrus.Warn("unsupported: HINT for c.li")
+				fallthrough
+			default:
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%d;\n", rd, signext.SignExt(int(imm), 6))
+			}
+		case decoder.Clui: // c.lui or c.addi16sp
+			switch rdMaybe := inst.CRdRs1(); rdMaybe {
+			case 2: // c.addi16sp imm: x[2] = x[2] + sext(imm)
+				imm := inst.CADDI16Imm()
+				if imm == 0 {
+					return errors.New("c.addi16sp: imm must not be zero")
+				}
+				fmt.Fprintf(w, "_ma_regs.x[2] += (_ma_signed_reg_t)%d;\n", signext.SignExt(int(imm), 10))
+			case 0:
+				logrus.Warn("unsupported: HINT for c.lui")
+				fallthrough
+			default: // c.lui rd,imm: x[rd] = sext(imm[17:12] << 12)
+				imm := inst.CLUIImm()
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_signed_reg_t)%d;\n", rdMaybe, signext.SignExt(int(imm), 18))
+			}
+		case decoder.Extend6:
+			cf6tail := decoder.Funct6Tail((inst.BinWord >> 10) & 0b11)
+			switch cf6tail {
+			case decoder.Csrli:
+				if elfHeader.Class == elf.ELFCLASS32 && bit12 != 0 {
+					return errors.New("c.srli: bit12 must be zero for RV32C")
+				}
+				rd, uimm := inst.CRdRs1Short(), inst.CIImm()
+				switch uimm {
+				case 0:
+					logrus.Warn("unsupported: HINT for c.srli")
+					fallthrough
+				default: // c.srli rd’,uimm: x[8+rd’] = x[8+rd’] >>u uimm
+					fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_regs.x[%d] >> %d);\n", rd, rd, uimm)
+				}
+			case decoder.Csrai:
+				if elfHeader.Class == elf.ELFCLASS32 && bit12 != 0 {
+					return errors.New("c.srai: bit12 must be zero for RV32C")
+				}
+				rd, uimm := inst.CRdRs1Short(), inst.CIImm()
+				switch uimm {
+				case 0:
+					logrus.Warn("unsupported: HINT for c.srai")
+					fallthrough
+				default: // c.srai rd’,uimm: x[8+rd’] = x[8+rd’] >>s uimm
+					fmt.Fprintf(w, "_ma_regs.x[%d] = ((_ma_signed_reg_t)_ma_regs.x[%d] >> %d);\n", rd, rd, uimm)
+				}
+			case decoder.Candi: // c.andi rd’,imm: x[8+rd’] = x[8+rd’] & sext(imm)
+				rd, imm := inst.CRdRs1Short(), inst.CIImm()
+				fmt.Fprintf(w, "_ma_regs.x[%d] &= %d;\n", rd, signext.SignExt(int(imm), 6))
+			case decoder.RegGroupTail:
+				switch bit12 {
+				case decoder.RegGroupMid:
+					rd, rs2 := inst.CRdRs1Short(), inst.CRs2Short()
+					switch cf2 := decoder.Funct2((inst.BinWord >> 5) & 0b11); cf2 {
+					case decoder.Csub: // c.sub rd’,rs2’: x[8+rd’] = x[8+rd’] - x[8+rs2’]
+						fmt.Fprintf(w, "_ma_regs.x[%d] -= _ma_regs.x[%d];\n", rd, rs2)
+					case decoder.Cxor: // c.xor rd’,rs2’: x[8+rd’] = x[8+rd’] ^ x[8+rs2’]
+						fmt.Fprintf(w, "_ma_regs.x[%d] ^= _ma_regs.x[%d];\n", rd, rs2)
+					case decoder.Cor: // c.or rd’,rs2’: x[8+rd’] = x[8+rd’] | x[8+rs2’]
+						fmt.Fprintf(w, "_ma_regs.x[%d] |= _ma_regs.x[%d];\n", rd, rs2)
+					case decoder.Cand: // c.and rd’,rs2’: x[8+rd’] = x[8+rd’] & x[8+rs2’]
+						fmt.Fprintf(w, "_ma_regs.x[%d] &= _ma_regs.x[%d];\n", rd, rs2)
+					}
+				case 1:
+					rd, rs2 := inst.CRdRs1Short(), inst.CRs2Short()
+					switch cf2 := decoder.Funct2((inst.BinWord >> 5) & 0b11); cf2 {
+					case 0: // c.subw rd’,rs2’: x[8+rd’] = sext((x[8+rd’] - x[8+rs2’])[31:0])
+						if elfHeader.Class == elf.ELFCLASS32 {
+							return errors.New("c.subw: invalid for RV32")
+						}
+						fmt.Fprintf(w, "u32 = (uint32_t)(_ma_regs.x[%d] - _ma_regs.x[%d]);\n", rd, rs2)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+					case 1: // c.addw rd’,rs2’: x[8+rd’] = sext((x[8+rd’] + x[8+rs2’])[31:0])
+						if elfHeader.Class == elf.ELFCLASS32 {
+							return errors.New("c.addw: invalid for RV32")
+						}
+						fmt.Fprintf(w, "u32 = (uint32_t)(_ma_regs.x[%d] + _ma_regs.x[%d]);\n", rd, rs2)
+						fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
+					default:
+						return fmt.Errorf("unsupported C1 Extend6 cf2 %+v", cf2)
+					}
+				}
+			}
+		case decoder.Cj: // c.j offset: pc += sext(offset)
+			imm := inst.CJImm()
+			stmt := generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 12)), segHead, segSize)
+			fmt.Fprintln(w, stmt)
+		case decoder.Cbeqz: // c.beqz rs1’,offset: if (x[8+rs1’] == 0) pc += sext(offset)
+			rs1, imm := inst.CRdRs1Short(), inst.CBImm()
+			stmt := generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 9)), segHead, segSize)
+			fmt.Fprintf(w, "if (_ma_regs.x[%d] == 0) { %s }\n", rs1, stmt)
+		case decoder.Cbnez: // c.bnez rs1’,offset: if (x[8+rs1’] != 0) pc += sext(offset)
+			rs1, imm := inst.CRdRs1Short(), inst.CBImm()
+			stmt := generateStaticJumpStmt(instAddr+uint64(signext.SignExt(int(imm), 9)), segHead, segSize)
+			fmt.Fprintf(w, "if (_ma_regs.x[%d] != 0) { %s }\n", rs1, stmt)
+		default:
+			return fmt.Errorf("unsupported C1 cfunct3 %+v", cf3)
+		}
+	case decoder.C2:
+		switch cf3 := inst.CFunct3(); cf3 {
+		case decoder.Cslli:
+			if elfHeader.Class == elf.ELFCLASS32 && bit12 != 0 {
+				return errors.New("c.slli: bit12 must be zero for RV32C")
+			}
+			rd, uimm := inst.CRdRs1(), inst.CIImm()
+			switch uimm {
+			case 0:
+				logrus.Warn("unsupported: HINT for c.slli")
+				fallthrough
+			default: // c.slli rd,uimm: x[rd] = x[rd] << uimm
+				fmt.Fprintf(w, "_ma_regs.x[%d] <<= %d;\n", rd, uimm)
+			}
+		case decoder.Cfldsp: // c.fldsp rd,uimm(x2): f[rd] = M[x[2] + uimm][63:0]
+			return errors.New("unsupported: c.fldsp")
+		case decoder.Clwsp:
+			rd, uimm := inst.CRdRs1(), inst.CLWSPImm()
+			switch rd {
+			case 0: // reserved
+				return errors.New("reserved instruction")
+			default: // c.lwsp rd,uimm(x2): x[rd] = sext(M[x[2] + uimm][31:0])
+				fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[2] + (_ma_reg_t)%d);\n", uimm)
+				fmt.Fprintln(w, "u32 = *(uint32_t*)p;")
+				fmt.Fprintf(w, "_ma_regs.x[%d] = (_ma_reg_t)_MA_SIGN_EXT((_ma_reg_t)u32, 32);\n", rd)
+			}
+		case decoder.Cswsp: // c.swsp rs2,uimm(x2): M[x[2] + uimm][31:0] = x[rs2]
+			rs2, uimm := inst.CRs2(), inst.CSWSPImm()
+			fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[2] + (_ma_reg_t)%d);\n", uimm)
+			fmt.Fprintf(w, "u32 = %s & 0xFFFFFFFF;\n", generateReadRegExpr(rs2))
+			fmt.Fprintln(w, "*(uint32_t*)p = u32;")
+		case decoder.Cflwsp: // c.flwsp (32-bit ABI) or c.ldsp (64-bit ABI)
+			switch elfHeader.Class {
+			case elf.ELFCLASS32: // c.flwsp rd,uimm(x2): f[rd] = M[x[2] + uimm][31:0]
+				return errors.New("unsupported: c.flwsp")
+			case elf.ELFCLASS64:
+				rd, uimm := inst.CRdRs1(), inst.CLDSPImm()
+				switch rd {
+				case 0: // reserved
+					return errors.New("reserved instruction")
+				default: // c.ldsp rd,uimm(x2): x[rd] = M[x[2] + uimm][63:0]
+					fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[2] + (_ma_reg_t)%d);\n", uimm)
+					fmt.Fprintln(w, "u64 = *(uint64_t*)p;")
+					fmt.Fprintf(w, "_ma_regs.x[%d] = u64;\n", rd)
+				}
+			}
+		case decoder.CMvAdd:
+			bit12 := decoder.Bit12((inst.BinWord >> 12) & 0b1)
+			switch bit12 {
+			case decoder.Cmv: // c.mv or c.jr
+				if rs2Maybe := inst.CRs2(); rs2Maybe != 0 {
+					rd := inst.CRdRs1()
+					switch rd {
+					case 0:
+						logrus.Warn("unsupported: HINT for c.mv")
+						fallthrough
+					default: // c.mv rd,rs2: x[rd] = x[rs2]
+						fmt.Fprintf(w, "_ma_regs.x[%d] = _ma_regs.x[%d];\n", rd, rs2Maybe)
+					}
+				} else {
+					switch rs1 := inst.CRdRs1(); rs1 {
+					case 0: // reserved
+						return errors.New("reserved instruction")
+					default: // c.jr rs1: pc = x[rs1]
+						fmt.Fprintf(w, "_MA_JUMP(_ma_regs.x[%d]);\n", rs1)
+					}
+				}
+			case decoder.Cadd: // c.add, c.jalr, or c.ebreak
+				rdOrRs1, rs2 := inst.CRdRs1(), inst.CRs2()
+				switch rs2 {
+				case 0:
+					switch rdOrRs1 {
+					case 0: // c.ebreak: RaiseException(Breakpoint)
+						fmt.Fprintf(w, "_MA_RAISE_BREAK(0x%08X);\n", instAddr)
+					default: // c.jalr rs1: t = pc+2; pc = x[rs1]; x[1] = t
+						fmt.Fprintf(w, "tmp = _ma_regs.x[%d];\n", rdOrRs1)
+						fmt.Fprintf(w, "_ma_regs.x[1] = 0x%08X;\n", instAddr+2)
+						fmt.Fprintln(w, "_MA_JUMP(tmp);")
+					}
+				default: // c.add rd,rs2: x[rd] = x[rd] + x[rs2]
+					switch rdOrRs1 {
+					case 0:
+						logrus.Warn("unsupported: HINT for c.add")
+						fallthrough
+					default:
+						fmt.Fprintf(w, "_ma_regs.x[%d] += _ma_regs.x[%d];\n", rdOrRs1, rs2)
+					}
+				}
+			}
+		case decoder.Cfsdsp: // c.fsdsp rs2,uimm(x2): M[x[2] + uimm][63:0] = f[rs2]
+			return errors.New("unsupported: c.fsdsp")
+		case decoder.Cfswsp: // c.fswsp (32-bit ABI) or c.sdsp (64-bit ABI)
+			switch elfHeader.Class {
+			case elf.ELFCLASS32: // c.fswsp rs2,uimm(rs2): M[x[2] + uimm][31:0] = f[rs2]
+				return errors.New("unsupported: c.fswsp")
+			case elf.ELFCLASS64: // c.sdsp rs2,uimm(x2): M[x[2] + uimm][63:0] = x[rs2]
+				rs2, uimm := inst.CRs2(), inst.CSDSPImm()
+				fmt.Fprintf(w, "p = _ma_translate_ptr(_ma_regs.x[2] + (_ma_reg_t)%d);\n", uimm)
+				fmt.Fprintf(w, "u64 = _ma_regs.x[%d];\n", rs2)
+				fmt.Fprintln(w, "*(uint64_t*)p = u64;")
+			}
+		default:
+			return fmt.Errorf("unsupported C2 cfunct3 %+v", cf3)
 		}
 	default:
 		return fmt.Errorf("unsupported major opcode 0x%02X", inst.MajOp)

@@ -1,6 +1,6 @@
-# MyAOT: An experimental AOT(-ish) compiler (Linux/riscv32 ELF -> Linux/x86\_64 ELF, Darwin/arm64 Mach-O, WASM, ...)
+# MyAOT: An experimental AOT(-ish) compiler (Linux/riscv ELF -> Linux/x86\_64 ELF, Darwin/arm64 Mach-O, WASM, ...)
 
-MyAOT is an experimental AOT(-ish) compiler that translates a Linux/riscv32 ELF binary to:
+MyAOT is an experimental AOT(-ish) compiler that translates a Linux/riscv ELF binary to:
 - Linux ELF (x86\_64, aarch64, and other little-endian architectures)
 - Darwin Mach-O (x86\_64, arm64)
 - WASM
@@ -11,7 +11,7 @@ Only trivial programs work.
 - No support for shared objects
 - No support for memory protection
 - No support for threading
-- ISA is limited to (a subset of) RV32IA
+- Incomplete support for "A", "F", "D", and "C" instructions
 - Lots of syscalls are still unimplemented
 - Generated code is not optimized
 
