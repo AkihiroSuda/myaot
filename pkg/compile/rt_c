@@ -19,12 +19,32 @@
 #include <termios.h>
 #include <time.h>
 
+#if !defined(_MA_REG_WIDTH)
+#define _MA_REG_WIDTH 32
+#endif /* _MA_REG_WIDTH */
+#if _MA_REG_WIDTH == 64
+typedef uint64_t _ma_reg_t;
+typedef int64_t _ma_signed_reg_t;
+#if defined(__linux__)
+#define _MA_PRId "ld"
+#define _MA_PRIx "lx"
+#else /* defined(__linux__) */
+#define _MA_PRId "lld"
+#define _MA_PRIx "llx"
+#endif /* defined(__linux__) */
+#else
+typedef uint32_t _ma_reg_t;
+typedef int32_t _ma_signed_reg_t;
+#define _MA_PRId "d"
+#define _MA_PRIx "x"
+#endif /* _MA_REG_WIDTH == 64 */
+
 #if defined(_MA_DEBUG)
 static bool _ma_debug = true;
 #define _MA_DEBUGF(fmt, ...) \
   do { \
     if (_ma_debug) { \
-      fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
+      fprintf(stderr, "MyAOT| " fmt "\n", ## __VA_ARGS__); \
     } \
   } while (0)
 #else /* _MA_DEBUG */
@@ -33,7 +53,13 @@ static bool _ma_debug = true;
 
 #define _MA_FATALF(fmt, ...) \
   do { \
-    fprintf(stderr, "MyAOT| " fmt "\n", __VA_ARGS__); \
+    fprintf(stderr, "MyAOT| " fmt "\n", ## __VA_ARGS__); \
+    abort(); \
+  } while (0)
+
+#define _MA_RAISE_BREAK(pc) \
+  do { \
+    fprintf(stderr, "MyAOT| Breakpoint: PC=0x%08"_MA_PRIx"\n", (_ma_reg_t)(pc)); \
     abort(); \
   } while (0)
 
@@ -46,20 +72,41 @@ static bool _ma_debug = true;
 #endif /* MIN */
 
 /* _MA_SIGN_BIT(4) =  0b0000'1000 */
-#define _MA_SIGN_BIT(pos) (1LL << ((pos)-1))
+#define _MA_SIGN_BIT(bits) (1LL << ((bits)-1))
 /* _MA_SIGN_MASK(4) = 0b1111'1000 */
-#define _MA_SIGN_MASK(pos) (~(_MA_SIGN_BIT((pos))-1))
-#define _MA_SIGN_EXT(val, pos) ((val) & _MA_SIGN_BIT((pos)) ? ((val) | _MA_SIGN_MASK((pos))) : (val))
+#if _MA_REG_WIDTH == 64
+/* To avoid overflow */
+#define _MA_SIGN_MASK(bits) (~((unsigned __int128)_MA_SIGN_BIT((bits))-1))
+#else
+#define _MA_SIGN_MASK(bits) (~(_MA_SIGN_BIT((bits))-1))
+#endif
+#define _MA_SIGN_EXT(val, bits) ((val) & _MA_SIGN_BIT((bits)) ? ((val) | _MA_SIGN_MASK((bits))) : (val))
 
-#define __MA_JUMP_NEAR(addr, seg_head, addr_labels) goto *(addr_labels)[((addr) - (seg_head))/4]
+#define _MA_MIN_INST_LEN 2
+#if defined(_MA_DEBUG)
+#define __MA_JUMP_NEAR(addr, seg_head, addr_labels) \
+  do { \
+    _MA_DEBUGF("JUMP NEAR 0x%08"_MA_PRIx, addr); \
+    int __ma_jump_near_idx = (int)((_ma_reg_t)((addr) - (seg_head)) / _MA_MIN_INST_LEN); \
+    int __ma_jump_near_nlabels = sizeof((addr_labels)) / sizeof((addr_labels[0])); \
+    if (__ma_jump_near_idx >= __ma_jump_near_nlabels) { \
+      _MA_FATALF("JUMP NEAR: idx %d must not be >= nlabels %d", __ma_jump_near_idx, __ma_jump_near_nlabels);\
+    } \
+    const void *__ma_jump_near_p = (addr_labels)[__ma_jump_near_idx]; \
+    if (__ma_jump_near_p == NULL) { _MA_FATALF("JUMP NEAR: NULL"); } \
+    goto *__ma_jump_near_p; \
+  } while(0)
+#define __MA_JUMP_FAR(addr) \
+  do { \
+    _MA_DEBUGF("JUMP FAR 0x%08"_MA_PRIx, addr); \
+    return (addr); \
+  } while(0)
+#else
+#define __MA_JUMP_NEAR(addr, seg_head, addr_labels) goto *(addr_labels)[((addr) - (seg_head))/_MA_MIN_INST_LEN]
 #define __MA_JUMP_FAR(addr) return (addr)
+#endif
 #define __MA_JUMP(addr, seg_head, seg_size, addr_labels) \
-  if ((unsigned)((addr) - (seg_head)) < (seg_size)) { __MA_JUMP_NEAR((addr), (seg_head), (addr_labels)); } else { __MA_JUMP_FAR((addr)); }
-
-#if !defined(_MA_REG_TYPE)
-#define _MA_REG_TYPE uint32_t
-#endif /* _MA_REG_TYPE */
-typedef _MA_REG_TYPE _ma_reg_t;
+  if ((_ma_reg_t)((addr) - (seg_head)) < (seg_size)) { __MA_JUMP_NEAR((addr), (seg_head), (addr_labels)); } else { __MA_JUMP_FAR((addr)); }
 
 #define _MA_REG_ZERO 0 /* Hard-wired zero */
 #define _MA_REG_RA 1 /* Return address */
@@ -97,20 +144,20 @@ typedef _MA_REG_TYPE _ma_reg_t;
 
 struct _ma_regs {
   _ma_reg_t x[32];
+  double f[32];
 } _ma_regs;
 
 struct _ma_regs _ma_regs;
 
-
 void _ma_regs_dump(_ma_reg_t pc) {
-  _MA_DEBUGF("=== PC=%08X ===", pc);
-  _MA_DEBUGF("X0=%08X X1(RA)=%08X X2(SP)=%08X X3(GP)=%08X X4(TP)=%08X X5(T0)=%08X X6=%08X X7=%08X",
+  _MA_DEBUGF("=== PC=%08"_MA_PRIx" ===", pc);
+  _MA_DEBUGF("X0=%08"_MA_PRIx" X1(RA)=%08"_MA_PRIx" X2(SP)=%08"_MA_PRIx" X3(GP)=%08"_MA_PRIx" X4(TP)=%08"_MA_PRIx" X5(T0)=%08"_MA_PRIx" X6=%08"_MA_PRIx" X7=%08"_MA_PRIx"",
       _ma_regs.x[0], _ma_regs.x[1], _ma_regs.x[2], _ma_regs.x[3], _ma_regs.x[4], _ma_regs.x[5], _ma_regs.x[6], _ma_regs.x[7]);
-  _MA_DEBUGF("X8(S0/FP)=%08X X9(S1)=%08X X10(A0)=%08X X11=%08X X12=%08X, X13=%08X, X14=%08X, X15=%08X",
+  _MA_DEBUGF("X8(S0/FP)=%08"_MA_PRIx" X9(S1)=%08"_MA_PRIx" X10(A0)=%08"_MA_PRIx" X11=%08"_MA_PRIx" X12=%08"_MA_PRIx", X13=%08"_MA_PRIx", X14=%08"_MA_PRIx", X15=%08"_MA_PRIx"",
       _ma_regs.x[8], _ma_regs.x[9], _ma_regs.x[10], _ma_regs.x[11], _ma_regs.x[12], _ma_regs.x[13], _ma_regs.x[14], _ma_regs.x[15]);
-  _MA_DEBUGF("X16=%08X X17=%08X X18(S2)=%08X X19=%08X X20=%08X X21=%08X X22=%08X X23=%08X",
+  _MA_DEBUGF("X16=%08"_MA_PRIx" X17=%08"_MA_PRIx" X18(S2)=%08"_MA_PRIx" X19=%08"_MA_PRIx" X20=%08"_MA_PRIx" X21=%08"_MA_PRIx" X22=%08"_MA_PRIx" X23=%08"_MA_PRIx"",
       _ma_regs.x[16], _ma_regs.x[17], _ma_regs.x[18], _ma_regs.x[19], _ma_regs.x[20], _ma_regs.x[21], _ma_regs.x[22], _ma_regs.x[23]);
-  _MA_DEBUGF("X24=%08X X25=%08X X26=%08X X27=%08X X28(T3)=%08X X29=%08X X30=%08X X31=%08X",
+  _MA_DEBUGF("X24=%08"_MA_PRIx" X25=%08"_MA_PRIx" X26=%08"_MA_PRIx" X27=%08"_MA_PRIx" X28(T3)=%08"_MA_PRIx" X29=%08"_MA_PRIx" X30=%08"_MA_PRIx" X31=%08"_MA_PRIx"",
       _ma_regs.x[24], _ma_regs.x[25], _ma_regs.x[26], _ma_regs.x[27], _ma_regs.x[28], _ma_regs.x[29], _ma_regs.x[30], _ma_regs.x[31]);
 }
 
@@ -132,16 +179,21 @@ void _ma_vma_heap_entry_init(void) {
   _ma_vma_heap_entry->addr = 0x40000000; /* 1GiB */ /* FIXME */
   _ma_vma_heap_cur = _ma_vma_heap_entry->addr;
   _ma_vma_heap_entry->len = 1 * 1024 * 1024 * 1024; /* 1 GiB */ /* FIXME */
-  _MA_DEBUGF("Heap begin=0x%X len=0x%x", _ma_vma_heap_entry->addr, _ma_vma_heap_entry->len);
+  _MA_DEBUGF("Heap begin=0x%"_MA_PRIx" len=%"_MA_PRId, _ma_vma_heap_entry->addr, _ma_vma_heap_entry->len);
   _ma_vma_heap_entry->bytes = malloc(_ma_vma_heap_entry->len);
 }
 
 void _ma_vma_stack_entry_init(int argc, char *argv[]) {
   _ma_reg_t argc_dummy = 1; /* FIXME: proper argc */
   _ma_reg_t sp;
+#if _MA_REG_WIDTH == 32
   _ma_vma_stack_entry->addr = 0xc0000000; /* 3 GiB */ /* FIXME */
+#else
+  _ma_vma_stack_entry->addr = 0x7ffffffff000; /* 128 TiB */ /* FIXME */
+#endif
   _ma_vma_stack_entry->len = 4 * 1024 * 1024; /* 4 MiB */ /* FIXME */
-  _MA_DEBUGF("Stack begin=0x%X len=0x%x", _ma_vma_stack_entry->addr, _ma_vma_stack_entry->len);
+  _ma_vma_stack_entry->addr -= _ma_vma_stack_entry->len;
+  _MA_DEBUGF("Stack begin=0x%"_MA_PRIx" len=%"_MA_PRId, _ma_vma_stack_entry->addr, _ma_vma_stack_entry->len);
   _ma_vma_stack_entry->bytes = malloc(_ma_vma_stack_entry->len);
   memset(_ma_vma_stack_entry->bytes, 0, _ma_vma_stack_entry->len);
   /* Initialize the stack */
@@ -202,7 +254,7 @@ void* _ma_translate_ptr(_ma_reg_t r) {
     if (ent == NULL) break;
     if (ent->addr <= r && r <= ent->addr + ent->len -1) {
       if (ent->bytes == NULL) {
-        _MA_DEBUGF("Mapping VMA address 0x%08X", r);
+        _MA_DEBUGF("Mapping VMA address 0x%08"_MA_PRIx, r);
         ent->bytes = malloc(ent->len);
         memset(ent->bytes, 0, ent->len);
       }
@@ -211,7 +263,7 @@ void* _ma_translate_ptr(_ma_reg_t r) {
     }
     i++;
   }
-  _MA_DEBUGF("_ma_translate_ptr(0x%08X) --> 0x%08llX", r, (long long)ret);
+  _MA_DEBUGF("_ma_translate_ptr(0x%08"_MA_PRIx") --> 0x%08llx", r, (long long)ret);
   return ret;
 }
 
@@ -289,7 +341,7 @@ struct _ma_statx {
 #define _MA_STATX_ATTR_DAX  0x00200000
 
 void _ma_ecall(void) {
-  _MA_DEBUGF("Syscall %d (%d, %d, %d, %d, %d, %d)",
+  _MA_DEBUGF("Syscall %"_MA_PRId" (%"_MA_PRId", %"_MA_PRId",%"_MA_PRId", %"_MA_PRId", %"_MA_PRId", %"_MA_PRId")",
       _ma_regs.x[_MA_REG_A7],
       _ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2], _ma_regs.x[_MA_REG_A3], _ma_regs.x[_MA_REG_A4], _ma_regs.x[_MA_REG_A5]);
   errno = 0;
@@ -324,7 +376,7 @@ void _ma_ecall(void) {
           default:
             _ma_regs.x[_MA_REG_A0] = -1;
             errno = _MA_EACCES;
-            _MA_FATALF("Unsupported ioctl(%d, 0x%08X, 0x%08X)", fd, cmd, arg);
+            _MA_FATALF("Unsupported ioctl(%"_MA_PRId", 0x%08"_MA_PRIx", 0x%08"_MA_PRIx")", fd, cmd, arg);
             break;
         }
       }
@@ -375,6 +427,22 @@ void _ma_ecall(void) {
       exit(_ma_regs.x[_MA_REG_A0]);
 #endif
       break;
+    case 79: /* asmlinkage long sys_newfstatat(int dfd, const char __user *filename, struct stat __user *statbuf, int flag); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_ENOSYS;
+      break;
+    case 96: /* asmlinkage long sys_set_tid_address(int __user *tidptr); */
+#if defined(__linux__)
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = gettid();
+#else
+      _ma_regs.x[_MA_REG_A0] = 0; /* STUB */
+#endif
+    case 99: /* asmlinkage long sys_set_robust_list(struct robust_list_head __user *head, size_t len); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = -1;
+      errno = _MA_ENOSYS;
     case 131: /* asmlinkage long sys_tgkill(pid_t tgid, pid_t pid, int sig); */
 #if defined(__linux__)
       _ma_regs.x[_MA_REG_A0] = tgkill(_ma_regs.x[_MA_REG_A0], _ma_regs.x[_MA_REG_A1], _ma_regs.x[_MA_REG_A2]);
@@ -401,7 +469,7 @@ void _ma_ecall(void) {
           .nodename = "myaot",
           .release = "6.0.0-0-myaot",
           .version = "#0-MyAOT",
-#if _MA_REG_TYPE == uint32_t
+#if _MA_REG_WIDTH == 32
           .machine = "riscv32",
 #else
           .machine = "riscv64",
@@ -443,7 +511,7 @@ void _ma_ecall(void) {
           _ma_regs.x[_MA_REG_A0] <= _ma_vma_heap_entry->addr + _ma_vma_heap_entry->len - 1) {
         _ma_vma_heap_cur = _ma_regs.x[_MA_REG_A0];
       } else {
-        _MA_FATALF("Unsupported brk(0x%08X)", _ma_regs.x[_MA_REG_A0]);
+        _MA_FATALF("Unsupported brk(0x%08"_MA_PRIx")", _ma_regs.x[_MA_REG_A0]);
       }
       break;
     case 215: /* asmlinkage long sys_munmap(unsigned long addr, size_t len); */
@@ -453,28 +521,39 @@ void _ma_ecall(void) {
     case 222: /* void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset); */
       /* TODO */
       if (_ma_regs.x[_MA_REG_A4] != -1) {
-        _MA_FATALF("Unsupported mmap(A4=0x%08X)", _ma_regs.x[_MA_REG_A4]);
+        _MA_FATALF("Unsupported mmap(A4=0x%08"_MA_PRIx")", _ma_regs.x[_MA_REG_A4]);
       }
       if (_ma_regs.x[_MA_REG_A5] != 0) {
-        _MA_FATALF("Unsupported mmap(A5=0x%08X)", _ma_regs.x[_MA_REG_A5]);
+        _MA_FATALF("Unsupported mmap(A5=0x%08"_MA_PRIx")", _ma_regs.x[_MA_REG_A5]);
       }
       if (_ma_regs.x[_MA_REG_A0] == 0) {
         _ma_regs.x[_MA_REG_A0] = _ma_vma_heap_cur;
         _ma_vma_heap_cur += _ma_regs.x[_MA_REG_A1];
       } else {
-        _MA_FATALF("Unsupported mmap(A0=0x%08X)", _ma_regs.x[_MA_REG_A0]);
+        _MA_FATALF("Unsupported mmap(A0=0x%08"_MA_PRIx")", _ma_regs.x[_MA_REG_A0]);
       }
 			break;
     case 226: /* asmlinkage long sys_mprotect(unsigned long start, size_t len, unsigned long prot); */
       /* TODO */
       _ma_regs.x[_MA_REG_A0] = 0;
       break;
+    case 261: /* asmlinkage long sys_prlimit64(pid_t pid, unsigned int resource, const struct rlimit64 __user *new_rlim, struct rlimit64 __user *old_rlim); */
+      /* TODO */
+      _ma_regs.x[_MA_REG_A0] = 0;
+      break;
+    case 278: /* asmlinkage long sys_getrandom(char __user *buf, size_t count, unsigned int flags); */
+      {
+        _ma_reg_t buf = _ma_regs.x[_MA_REG_A0];
+        _ma_reg_t count = _ma_regs.x[_MA_REG_A1];
+        _ma_regs.x[_MA_REG_A0] = getentropy(_ma_translate_ptr(buf), count);
+      }
+      break;
     case 291: /* asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags, unsigned mask, struct statx __user *buffer); */
       {
         _ma_reg_t dfd = _ma_regs.x[_MA_REG_A0];
         _ma_reg_t flags = _ma_regs.x[_MA_REG_A2];
         if ((flags & _MA_AT_EMPTY_PATH) == 0) {
-          _MA_FATALF("Unsupported statx(flags=0x%08X)", flags);
+          _MA_FATALF("Unsupported statx(flags=0x%08"_MA_PRIx")", flags);
         }
         struct stat st;
         errno = fstat(dfd, &st);
@@ -498,6 +577,8 @@ void _ma_ecall(void) {
         }
       }
       break;
+    case 113:
+      /* fallthrough */
     case 403: /* asmlinkage long sys_clock_gettime(clockid_t which_clock, struct __kernel_timespec __user *tp); */
       {
         /* TODO: check which_clock */
@@ -520,11 +601,11 @@ void _ma_ecall(void) {
         /* FUTEX_WAIT */
         _ma_regs.x[_MA_REG_A0] = 0;
       } else {
-        _MA_FATALF("Unknown futex op 0%08X", _ma_regs.x[_MA_REG_A1]);
+        _MA_FATALF("Unknown futex op 0%08"_MA_PRIx, _ma_regs.x[_MA_REG_A1]);
       }
       break;
     default:
-      _MA_FATALF("Unknown syscall number %d", _ma_regs.x[_MA_REG_A7]);
+      _MA_FATALF("Unknown syscall number %"_MA_PRId, _ma_regs.x[_MA_REG_A7]);
       break;
   }
   if (errno != 0) {

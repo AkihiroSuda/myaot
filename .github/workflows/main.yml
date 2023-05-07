@@ -18,10 +18,25 @@ jobs:
           go-version: 1.20.x
       - uses: actions/checkout@v3
       - run: go install ./cmd/myaot
-      - run: |
+      - name: examples/hello-s/hello-riscv32
+        run: |
           set -eux
           myaot compile ./examples/hello-s/hello-riscv32
           [ "$(./a.out)" = "Hello World!" ]
+      - name: examples/hello-s/hello-riscv64
+        run: |
+          set -eux
+          myaot compile ./examples/hello-s/hello-riscv32
+          [ "$(./a.out)" = "Hello World!" ]
+      - name: examples/hello-c/hello-riscv64
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu
+          ( cd ./examples/hello-c && ./make.sh )
+          myaot compile ./examples/hello-c/hello-riscv64
+          [ "$(./a.out)" = "Hello, C." ]
 
   wasm:
     runs-on: ubuntu-22.04
