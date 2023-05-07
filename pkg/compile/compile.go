@@ -464,13 +464,13 @@ func generateCodeEntry(w io.Writer, elfHeader *elf.FileHeader, segHead, segSize,
 					if elfHeader.Class == elf.ELFCLASS32 {
 						return errors.New("addw: invalid for RV32")
 					}
-					fmt.Fprintf(w, "u32 = (uint32_t)(%s + %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "u32 = ((uint32_t)%s + (uint32_t)%s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 				case decoder.Sub: /* subw rd,rs1,rs2: x[rd] = sext((x[rs1] - x[rs2])[31:0]) */
 					if elfHeader.Class == elf.ELFCLASS32 {
 						return errors.New("subw: invalid for RV32")
 					}
-					fmt.Fprintf(w, "u32 = (uint32_t)(%s - %s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
+					fmt.Fprintf(w, "u32 = ((uint32_t)%s - (uint32_t)%s);\n", generateReadRegExpr(rs1), generateReadRegExpr(rs2))
 					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 				default:
 					return fmt.Errorf("unsupported IntRegReg32 funct3 %+v funct7 %+v", f3, f7)
@@ -479,10 +479,10 @@ func generateCodeEntry(w io.Writer, elfHeader *elf.FileHeader, segHead, segSize,
 				switch f7 {
 				case 0: /* sllw rd,rs1,rs2: x[rd] = sext((x[rs1] << x[rs2][4:0])[31:0]) */
 					if elfHeader.Class == elf.ELFCLASS32 {
-						return errors.New("slli: invalid for RV32")
+						return errors.New("sllw: invalid for RV32")
 					}
-					shamt := rs2 & 0b11111 // 5 bits
-					fmt.Fprintf(w, "u32 = (uint32_t)(%s << %d);\n", generateReadRegExpr(rs1), shamt)
+					shamtExpr := fmt.Sprintf("%s & 0x%x", generateReadRegExpr(rs2), 0b11111) // 5 bits
+					fmt.Fprintf(w, "u32 = ((uint32_t)%s << (%s));\n", generateReadRegExpr(rs1), shamtExpr)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 				default:
 					return fmt.Errorf("unsupported IntRegReg32 funct3 %+v funct7 %+v", f3, f7)
@@ -553,18 +553,18 @@ func generateCodeEntry(w io.Writer, elfHeader *elf.FileHeader, segHead, segSize,
 				if shamt&0b11111 != shamt { // 5 bits
 					return fmt.Errorf("slliw: expected shamt to be <= 0b11111, got %b", shamt)
 				}
-				fmt.Fprintf(w, "u32 = (uint32_t)(%s << %d);\n", generateReadRegExpr(rs1), shamt)
+				fmt.Fprintf(w, "u32 = ((uint32_t)%s << %d);\n", generateReadRegExpr(rs1), shamt)
 				fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 			case decoder.Sr:
 				switch f7 {
-				case decoder.Srl: // sralw rd,rs1,shamt: x[rd] = sext(x[rs1][31:0] >>u shamt)
+				case decoder.Srl: // srliw rd,rs1,shamt: x[rd] = sext(x[rs1][31:0] >>u shamt)
 					if elfHeader.Class == elf.ELFCLASS32 {
-						return errors.New("sralw: invalid for RV32")
+						return errors.New("srliw: invalid for RV32")
 					}
 					if shamt&0b11111 != shamt { // 5 bits
-						return fmt.Errorf("sralw: expected shamt to be <= 0b11111, got %b", shamt)
+						return fmt.Errorf("srliw: expected shamt to be <= 0b11111, got %b", shamt)
 					}
-					fmt.Fprintf(w, "u32 = (%s >> %d);\n", generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "u32 = ((uint32_t)%s >> %d);\n", generateReadRegExpr(rs1), shamt)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 				case decoder.Sra: // sraiw rd,rs1,shamt: x[rd] = sext(x[rs1][31:0] >>s shamt)
 					if elfHeader.Class == elf.ELFCLASS32 {
@@ -573,7 +573,7 @@ func generateCodeEntry(w io.Writer, elfHeader *elf.FileHeader, segHead, segSize,
 					if shamt&0b11111 != shamt { // 5 bits
 						return fmt.Errorf("sraiw: expected shamt to be <= 0b11111, got %b", shamt)
 					}
-					fmt.Fprintf(w, "u32 = ((_ma_signed_reg_t)%s >> %d);\n", generateReadRegExpr(rs1), shamt)
+					fmt.Fprintf(w, "u32 = ((int32_t)%s >> %d);\n", generateReadRegExpr(rs1), shamt)
 					fmt.Fprintf(w, "_ma_regs.x[%d] = _MA_SIGN_EXT(u32, 32);\n", rd)
 				default:
 					return fmt.Errorf("unsupported IntRegImm32 funct7 %+v", f7)
